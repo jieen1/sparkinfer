@@ -5480,19 +5480,31 @@ class MoEDynamicKernelBackend:
                                     self.epilog_sync_barrier.arrive_and_wait()
                                     tile_amax = ld_shared_f32(reduce_scratch_addr)
                                     tile_gs_value = cutlass.Float32(0.0)
+                                    # A (near-)zero tile amax means this tile
+                                    # carries no real signal to recalibrate
+                                    # from. Previously the 1e-12 floor below
+                                    # was applied unconditionally and then
+                                    # inverted into fc2_down_alpha_value,
+                                    # turning "no signal" into a ~1e12x alpha
+                                    # blowup (NaN/Inf output at Laguna-S-2.1's
+                                    # shape: E=256,K=3072,I=1024,top_k=10 --
+                                    # see issue for repro). Only recalibrate
+                                    # when the scan actually found a positive
+                                    # amax; otherwise keep the static
+                                    # fc2_down_alpha_value/quant_gs_value
+                                    # defaults set above this epi_m loop.
                                     if tile_amax > cutlass.Float32(0.0):
                                         tile_gs_value = (
                                             cutlass.Float32(_FC2_TILE_RECIP_GS_NUM)
                                             / tile_amax
                                         )
-                                    tile_gs_value = fmax_f32(
-                                        tile_gs_value, cutlass.Float32(1.0e-12)
-                                    )
-                                    if tile_gs_value != cutlass.Float32(0.0):
+                                        tile_gs_value = fmax_f32(
+                                            tile_gs_value, cutlass.Float32(1.0e-12)
+                                        )
                                         fc2_down_alpha_value = down_alpha_value * (
                                             gs_value / tile_gs_value
                                         )
-                                    quant_gs_value = tile_gs_value
+                                        quant_gs_value = tile_gs_value
                                     self.epilog_sync_barrier.arrive_and_wait()
                             quant_idx = Int32(tidx)
                             while quant_idx < epi_rows * sf_blocks_per_row:

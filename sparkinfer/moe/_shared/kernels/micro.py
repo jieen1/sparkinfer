@@ -4535,10 +4535,18 @@ class MoEMicroKernelBackend:
                     gs_fc2_eff = (
                         Float32(_FC2_TILE_RECIP_GS_NUM) / reduce_scratch[Int32(0)]
                     )
-                gs_fc2_eff = fmax_f32(gs_fc2_eff, Float32(1.0e-12))
+                    gs_fc2_eff = fmax_f32(gs_fc2_eff, Float32(1.0e-12))
             fc2_rescale = Float32(1.0)
             if cutlass.const_expr(self.dynamic_down_scale):
-                if gs_fc2_eff != Float32(0.0):
+                # A (near-)zero tile amax means this tile carries no real
+                # signal to recalibrate from. Previously the 1e-12 floor
+                # below was applied unconditionally and then inverted here,
+                # turning "no signal" into a ~1e12x rescale blowup (NaN/Inf
+                # output at Laguna-S-2.1's shape: E=256,K=3072,I=1024,
+                # top_k=10 -- see issue for repro). Only rescale when the
+                # scan actually found a positive amax; otherwise keep the
+                # identity default set above.
+                if reduce_scratch[Int32(0)] > Float32(0.0):
                     fc2_rescale = gs_fc2 / gs_fc2_eff
             if tidx < Int32(cfg.inter_blocks):
                 mid_blk = tidx
