@@ -453,6 +453,13 @@ def _w4a8_stage_bytes8(
 
 _PRODUCER_PAIRS_PER_WARP = 2
 _FC2_TILE_RECIP_GS_NUM = 6.0 * 448.0
+# See the matching constant/comment in kernels/micro.py: dynamic_down_scale's
+# fc2_down_alpha_value = down_alpha_value * (gs_value / tile_gs_value) is
+# unbounded by design and can overflow FP32 through the FC2 accumulation
+# when a tile's real magnitude greatly exceeds the caller's static gs_value
+# calibration (observed as Inf/NaN on Laguna-S-2.1's shape: E=256, K=3072,
+# I=1024, top_k=10 -- see issue for repro). Cap the ratio.
+_FC2_RESCALE_MAX = 1.0e4
 
 
 class DynamicLaunchParams:
@@ -5501,8 +5508,15 @@ class MoEDynamicKernelBackend:
                                         tile_gs_value = fmax_f32(
                                             tile_gs_value, cutlass.Float32(1.0e-12)
                                         )
-                                        fc2_down_alpha_value = down_alpha_value * (
-                                            gs_value / tile_gs_value
+                                        fc2_rescale_ratio = gs_value / tile_gs_value
+                                        if fc2_rescale_ratio > cutlass.Float32(
+                                            _FC2_RESCALE_MAX
+                                        ):
+                                            fc2_rescale_ratio = cutlass.Float32(
+                                                _FC2_RESCALE_MAX
+                                            )
+                                        fc2_down_alpha_value = (
+                                            down_alpha_value * fc2_rescale_ratio
                                         )
                                         quant_gs_value = tile_gs_value
                                     self.epilog_sync_barrier.arrive_and_wait()

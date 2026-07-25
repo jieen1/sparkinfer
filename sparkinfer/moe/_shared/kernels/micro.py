@@ -58,6 +58,16 @@ from sparkinfer.moe._shared.kernels.activations import (
 _BLOCK_SIZE = 16
 _FP8_E4M3_MAX = 448.0
 _FC2_TILE_RECIP_GS_NUM = 6.0 * _FP8_E4M3_MAX
+# dynamic_down_scale's fc2_rescale = gs_fc2 / gs_fc2_eff is, by design,
+# unbounded: it grows without limit whenever a tile's real magnitude
+# legitimately exceeds what the caller's static gs_fc2 was calibrated for.
+# With no ceiling this can overflow FP32 through the downstream FC2
+# accumulation (observed as Inf/NaN output on Laguna-S-2.1's shape --
+# E=256, K=3072, I=1024, top_k=10 -- see issue for repro). Cap it: this
+# still corrects realistic multi-order-of-magnitude miscalibration while
+# keeping intermediate products far from FP32's ~3.4e38 ceiling even after
+# a K=1024-wide accumulation.
+_FC2_RESCALE_MAX = 1.0e4
 _NUM_WARPS = 16
 _BLOCK_DIM = _NUM_WARPS * 32
 _K_PER_CTA = 16
@@ -4548,6 +4558,8 @@ class MoEMicroKernelBackend:
                 # identity default set above.
                 if reduce_scratch[Int32(0)] > Float32(0.0):
                     fc2_rescale = gs_fc2 / gs_fc2_eff
+                    if fc2_rescale > Float32(_FC2_RESCALE_MAX):
+                        fc2_rescale = Float32(_FC2_RESCALE_MAX)
             if tidx < Int32(cfg.inter_blocks):
                 mid_blk = tidx
                 if cutlass.const_expr(self.a8_mx_mode):
