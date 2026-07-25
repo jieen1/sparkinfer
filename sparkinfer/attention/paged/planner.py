@@ -1021,6 +1021,27 @@ def plan_decode_graph_capacity(
             worst_page_count = page_count
 
     split_storage_required = force_split_kv is True or max_chunks_per_request > 1
+    # create_paged_plan sizes its actual capture-time launch grid
+    # (`padded_batch_size`) as max(max_batch_size_if_split, total_num_qo_tiles)
+    # -- a hardware-occupancy floor that does NOT shrink with window_left, since
+    # the launch grid is a fixed CTA count independent of how few KV pages a
+    # given request needs. This function's chunk-based max_work_items/
+    # max_partial_rows, by contrast, is bounded by max_effective_kv_pages (via
+    # chunk_pages_lut's length), which DOES shrink under window_left. For
+    # windowed/SWA attention the two diverge -- e.g. Laguna-S-2.1's SWA layers
+    # (window=512) compute a 9-chunk capacity here while create_paged_plan's
+    # actual padded_batch_size is 23, so the workspace under-allocates
+    # block_valid_mask and _ensure_capacity raises. Floor both fields at the
+    # same max_batch_size_if_split/direct_work_items values create_paged_plan
+    # uses so the two stay consistent for every window_left (see issue).
+    launch_grid_floor = max(
+        _graph_max_batch_size_if_split(
+            device=device,
+            num_kv_heads=num_kv_heads,
+            graph_ctas_per_sm=resolved_graph_ctas_per_sm,
+        ),
+        direct_work_items,
+    )
     return PagedDecodeGraphCapacity(
         graph_ctas_per_sm=int(resolved_graph_ctas_per_sm),
         cta_tile_q=int(cta_tile_q),
@@ -1028,10 +1049,15 @@ def plan_decode_graph_capacity(
         architecture_max_chunks_per_request=int(architecture_max_chunks),
         max_chunks_per_request=int(max_chunks_per_request),
         max_work_items=int(
-            batch * query_tiles_per_request * max_chunks_per_request
+            max(
+                batch * query_tiles_per_request * max_chunks_per_request,
+                launch_grid_floor,
+            )
         ),
         max_partial_rows=int(
-            batch * max_chunks_per_request if split_storage_required else 0
+            max(batch * max_chunks_per_request, launch_grid_floor)
+            if split_storage_required
+            else 0
         ),
         max_effective_kv_pages=int(max_effective_kv_pages),
         worst_page_count=int(worst_page_count),
