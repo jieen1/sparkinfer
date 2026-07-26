@@ -209,6 +209,7 @@ class TPDynamicWorkspace(TPMoEWorkspace):
     materialized_intermediate: torch.Tensor
     expert_write_rows: torch.Tensor
     expert_tile_base: torch.Tensor
+    pair_expert_rank: torch.Tensor
     input_gs: torch.Tensor
     down_input_scale: torch.Tensor
     pair_head: torch.Tensor
@@ -951,6 +952,7 @@ class TPMoEFP4Binding:
     task_capacity: int | None = None
     expert_write_rows: torch.Tensor | None = None
     expert_tile_base: torch.Tensor | None = None
+    pair_expert_rank: torch.Tensor | None = None
     input_gs: torch.Tensor | None = None
     down_input_scale: torch.Tensor | None = None
     pair_head: torch.Tensor | None = None
@@ -2293,6 +2295,7 @@ def _build_tp_moe_fp4_binding_from_views(
             materialized_intermediate=tensors["materialized_intermediate"],
             expert_write_rows=tensors["expert_write_rows"],
             expert_tile_base=tensors["expert_tile_base"],
+            pair_expert_rank=tensors["pair_expert_rank"],
             input_gs=tensors["input_gs"],
             down_input_scale=tensors["down_input_scale"],
             pair_head=tensors["pair_head"],
@@ -2692,6 +2695,9 @@ def _plan_core_workspace(
             _TensorAllocSpec(
                 "expert_tile_base", (state_E + 1,), torch.int32, init="zeros"
             ),
+            _TensorAllocSpec(
+                "pair_expert_rank", (dynamic_rows_padded,), torch.int32, init="zeros"
+            ),
             _TensorAllocSpec("input_gs", (weight_E,), torch.float32),
             _TensorAllocSpec("down_input_scale", (weight_E,), torch.float32),
             _TensorAllocSpec("pair_head", (1,), torch.int32, init="zeros"),
@@ -2937,6 +2943,7 @@ def _materialize_workspace_from_core_arena(
         packed_input_scale=tensors["packed_input_scale"],
         expert_write_rows=tensors["expert_write_rows"],
         expert_tile_base=tensors["expert_tile_base"],
+        pair_expert_rank=tensors["pair_expert_rank"],
         input_gs=tensors["input_gs"],
         down_input_scale=tensors["down_input_scale"],
         pair_head=tensors["pair_head"],
@@ -6360,6 +6367,7 @@ def build_tp_moe_fp4_binding(
             materialized_intermediate=workspace.materialized_intermediate,
             expert_write_rows=workspace.expert_write_rows,
             expert_tile_base=workspace.expert_tile_base,
+            pair_expert_rank=workspace.pair_expert_rank,
             input_gs=workspace.input_gs,
             down_input_scale=workspace.down_input_scale,
             pair_head=workspace.pair_head,
@@ -6816,6 +6824,7 @@ class _DynamicMoELaunch:
         row_counts: cute.Tensor,
         expert_write_rows: cute.Tensor,
         expert_tile_base: cute.Tensor,
+        pair_expert_rank_ptr: cute.Pointer,
         input_global_scale: cute.Tensor,
         alpha: cute.Tensor,
         down_alpha: cute.Tensor,
@@ -6846,6 +6855,9 @@ class _DynamicMoELaunch:
         scatter_output = cute.make_tensor(
             scatter_ptr,
             layout=cute.make_layout((scatter_rows, self._k), stride=(self._k, 1)),
+        )
+        pair_expert_rank = cute.make_tensor(
+            pair_expert_rank_ptr, layout=cute.make_layout((rows_padded,), stride=(1,))
         )
         packed_a = cute.make_tensor(
             packed_a_ptr,
@@ -6922,6 +6934,7 @@ class _DynamicMoELaunch:
             row_counts,
             expert_write_rows,
             expert_tile_base,
+            pair_expert_rank,
             input_global_scale,
             alpha,
             down_alpha,
@@ -6987,6 +7000,7 @@ class _DynamicMoEW4A8Launch:
         row_counts: cute.Tensor,
         expert_write_rows: cute.Tensor,
         expert_tile_base: cute.Tensor,
+        pair_expert_rank_ptr: cute.Pointer,
         input_global_scale: cute.Tensor,
         alpha: cute.Tensor,
         down_alpha: cute.Tensor,
@@ -7017,6 +7031,9 @@ class _DynamicMoEW4A8Launch:
         scatter_output = cute.make_tensor(
             scatter_ptr,
             layout=cute.make_layout((scatter_rows, self._k), stride=(self._k, 1)),
+        )
+        pair_expert_rank = cute.make_tensor(
+            pair_expert_rank_ptr, layout=cute.make_layout((rows_padded,), stride=(1,))
         )
         # E4M3 storage is one byte per element; the fp4-typed view spans 2k
         # nibble positions so the byte footprint is k per row.
@@ -7166,6 +7183,7 @@ class _DynamicMoEW4A8Launch:
             row_counts,
             expert_write_rows,
             expert_tile_base,
+            pair_expert_rank,
             input_global_scale,
             alpha,
             down_alpha,
@@ -7454,6 +7472,9 @@ def _get_dynamic_kernel(
         (E + 1,),
         assumed_align=4,
     )
+    pair_expert_rank_fake = make_ptr(
+        cutlass.Int32, 4, cute.AddressSpace.gmem, assumed_align=4
+    )
     input_gs_fake = cute.runtime.make_fake_compact_tensor(
         alpha_dtype,
         (E,),
@@ -7535,6 +7556,7 @@ def _get_dynamic_kernel(
         row_counts_fake,
         expert_write_rows_fake,
         expert_tile_base_fake,
+        pair_expert_rank_fake,
         input_gs_fake,
         alpha_fake,
         down_alpha_fake,
@@ -7587,6 +7609,7 @@ def _launch_dynamic_flat(
     row_counts: torch.Tensor,
     expert_write_rows: torch.Tensor,
     expert_tile_base: torch.Tensor,
+    pair_expert_rank: torch.Tensor,
     input_gs: torch.Tensor,
     down_input_scale: torch.Tensor,
     token_map: torch.Tensor,
@@ -7811,6 +7834,7 @@ def _launch_dynamic_flat(
         row_counts,
         expert_write_rows,
         expert_tile_base,
+        _gptr(cutlass.Int32, pair_expert_rank, 4),
         input_gs,
         w1_alpha,
         w2_alpha,
@@ -7834,6 +7858,18 @@ def _launch_dynamic_flat(
         mac,
         current_cuda_stream(),
     )
+
+
+# Packed into a single `flag_bits` int at the tp_moe_dynamic_launch custom-op
+# boundary because a torch custom op schema is hard-capped at 64 arguments by
+# this PyTorch build, and these six bools plus the rest of the tensor/scalar
+# arguments exceed that.
+_DYNAMIC_FLAG_TOPK_IDS_ARE_I32 = 1 << 0
+_DYNAMIC_FLAG_FAST_MATH = 1 << 1
+_DYNAMIC_FLAG_W4A8_REPACKED = 1 << 2
+_DYNAMIC_FLAG_SHARE_INPUT_ACROSS_EXPERTS = 1 << 3
+_DYNAMIC_FLAG_DETERMINISTIC_OUTPUT = 1 << 4
+_DYNAMIC_FLAG_VOLATILE_LAUNCH_STATE = 1 << 5
 
 
 @torch.library.custom_op(
@@ -7862,6 +7898,7 @@ def _tp_moe_dynamic_launch_op(
     row_counts: torch.Tensor,
     expert_write_rows: torch.Tensor,
     expert_tile_base: torch.Tensor,
+    pair_expert_rank: torch.Tensor,
     input_gs: torch.Tensor,
     down_input_scale: torch.Tensor,
     token_map: torch.Tensor,
@@ -7894,18 +7931,23 @@ def _tp_moe_dynamic_launch_op(
     scatter_rows: int,
     physical_tiles_capacity: int,
     task_capacity: int,
-    topk_ids_are_i32: bool,
-    fast_math: bool,
     activation: str,
     quant_mode: str,
-    w4a8_repacked: bool,
-    share_input_across_experts: bool,
-    deterministic_output: bool,
     swiglu_limit: float | None,
     swiglu_alpha: float,
     swiglu_beta: float,
-    volatile_launch_state: bool,
+    flag_bits: int,
 ) -> None:
+    # A torch custom op schema is hard-capped at 64 arguments by this
+    # PyTorch build; these six independent bools are packed into a single
+    # bitmask int here (and unpacked immediately below) purely to stay under
+    # that limit -- _launch_dynamic_flat still takes them individually.
+    topk_ids_are_i32 = bool(flag_bits & _DYNAMIC_FLAG_TOPK_IDS_ARE_I32)
+    fast_math = bool(flag_bits & _DYNAMIC_FLAG_FAST_MATH)
+    w4a8_repacked = bool(flag_bits & _DYNAMIC_FLAG_W4A8_REPACKED)
+    share_input_across_experts = bool(flag_bits & _DYNAMIC_FLAG_SHARE_INPUT_ACROSS_EXPERTS)
+    deterministic_output = bool(flag_bits & _DYNAMIC_FLAG_DETERMINISTIC_OUTPUT)
+    volatile_launch_state = bool(flag_bits & _DYNAMIC_FLAG_VOLATILE_LAUNCH_STATE)
     _launch_dynamic_flat(
         packed_a_view=packed_a_view,
         packed_a_flat=packed_a_flat,
@@ -7936,6 +7978,7 @@ def _tp_moe_dynamic_launch_op(
         row_counts=row_counts,
         expert_write_rows=expert_write_rows,
         expert_tile_base=expert_tile_base,
+        pair_expert_rank=pair_expert_rank,
         input_gs=input_gs,
         down_input_scale=down_input_scale,
         token_map=token_map,
@@ -7997,6 +8040,7 @@ def _tp_moe_dynamic_launch_fake(
     row_counts: torch.Tensor,
     expert_write_rows: torch.Tensor,
     expert_tile_base: torch.Tensor,
+    pair_expert_rank: torch.Tensor,
     input_gs: torch.Tensor,
     down_input_scale: torch.Tensor,
     token_map: torch.Tensor,
@@ -8029,17 +8073,12 @@ def _tp_moe_dynamic_launch_fake(
     scatter_rows: int,
     physical_tiles_capacity: int,
     task_capacity: int,
-    topk_ids_are_i32: bool,
-    fast_math: bool,
     activation: str,
     quant_mode: str,
-    w4a8_repacked: bool,
-    share_input_across_experts: bool,
-    deterministic_output: bool,
     swiglu_limit: float | None,
     swiglu_alpha: float,
     swiglu_beta: float,
-    volatile_launch_state: bool,
+    flag_bits: int,
 ) -> None:
     return None
 
@@ -8070,6 +8109,7 @@ def _launch_dynamic(
     swiglu_limit: float | None = None,
     swiglu_alpha: float = 1.0,
     swiglu_beta: float = 0.0,
+    pair_expert_rank: torch.Tensor | None = None,
 ) -> None:
     del stream
     if deterministic_output and workspace.route_output.numel() < routed_rows * k:
@@ -8080,6 +8120,11 @@ def _launch_dynamic(
         )
     kernel_output = workspace.route_output if deterministic_output else scatter_output
     scatter_rows = routed_rows if deterministic_output else m
+    if pair_expert_rank is None:
+        # Only read under deterministic_output (see the kernel's compile-time
+        # gated branch); any valid int32 tensor is a safe placeholder
+        # otherwise -- its contents are never touched.
+        pair_expert_rank = workspace.expert_write_rows
     w4a8_repacked = w4a8_prepared is not None
     w13_rp = w4a8_prepared["w13_rp"] if w4a8_repacked else workspace.row_counts
     w13_sfb_rp = w4a8_prepared["w13_sfb"] if w4a8_repacked else workspace.row_counts
@@ -8107,6 +8152,7 @@ def _launch_dynamic(
         workspace.row_counts,
         workspace.expert_write_rows,
         workspace.expert_tile_base,
+        pair_expert_rank,
         workspace.input_gs,
         workspace.down_input_scale,
         workspace.token_map,
@@ -8145,17 +8191,19 @@ def _launch_dynamic(
         scatter_rows,
         workspace.physical_tiles_capacity,
         workspace.task_capacity,
-        topk_ids_dtype == torch.int32,
-        bool(fast_math),
         activation,
         quant_mode,
-        w4a8_repacked,
-        bool(share_input_across_experts),
-        bool(deterministic_output),
         swiglu_limit,
         float(swiglu_alpha),
         float(swiglu_beta),
-        workspace.volatile_launch_state,
+        (
+            (_DYNAMIC_FLAG_TOPK_IDS_ARE_I32 if topk_ids_dtype == torch.int32 else 0)
+            | (_DYNAMIC_FLAG_FAST_MATH if fast_math else 0)
+            | (_DYNAMIC_FLAG_W4A8_REPACKED if w4a8_repacked else 0)
+            | (_DYNAMIC_FLAG_SHARE_INPUT_ACROSS_EXPERTS if share_input_across_experts else 0)
+            | (_DYNAMIC_FLAG_DETERMINISTIC_OUTPUT if deterministic_output else 0)
+            | (_DYNAMIC_FLAG_VOLATILE_LAUNCH_STATE if workspace.volatile_launch_state else 0)
+        ),
     )
 
 
@@ -8878,6 +8926,7 @@ def sparkinfer_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
             ),
             expert_write_rows=_require_binding_field(binding, "expert_write_rows"),
             expert_tile_base=_require_binding_field(binding, "expert_tile_base"),
+            pair_expert_rank=_require_binding_field(binding, "pair_expert_rank"),
             input_gs=_require_binding_field(binding, "input_gs"),
             down_input_scale=_require_binding_field(binding, "down_input_scale"),
             pair_head=_require_binding_field(binding, "pair_head"),
@@ -9180,6 +9229,33 @@ def sparkinfer_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
                 "the W4A8-MX weight plan did not materialize its required "
                 "QMMA representation"
             )
+        if deterministic_output:
+            # Stable rank of each routed pair within its expert group, in
+            # original pair-index order. Phase 1's producer stage otherwise
+            # assigns physical rows via a racing atomic_add against
+            # expert_write_rows[expert_id], which makes physical tile
+            # membership a function of GPU scheduling rather than the input
+            # alone. dynamic_down_scale's tile-level amax scan is computed
+            # over a tile's *collective* valid rows, so a scheduling-
+            # dependent tile membership makes its FC2 quantization scale --
+            # and therefore the kernel's output -- scheduling-dependent too,
+            # even for bit-identical inputs on the same binding. Precompute
+            # this rank host-side (torch's own stable sort) so tile
+            # membership is a pure function of topk_ids.
+            # argsort/bincount/indexing all accept flat_ids' native dtype
+            # (int32 or int64) directly -- no int64 normalization needed.
+            order = torch.argsort(flat_ids, stable=True)
+            counts = torch.bincount(flat_ids, minlength=weight_E)
+            group_start = torch.cumsum(counts, 0) - counts
+            rank_in_sorted_order = (
+                torch.arange(flat_ids.shape[0], device=flat_ids.device)
+                - group_start[flat_ids[order]]
+            )
+            # Scatter straight into the workspace slot -- skips the
+            # temporary buffer + copy_ the naive scatter-then-copy would need.
+            s.pair_expert_rank[: flat_ids.shape[0]][order] = rank_in_sorted_order.to(
+                torch.int32
+            )
         _launch_dynamic(
             workspace=s,
             weights=wv,
@@ -9201,6 +9277,7 @@ def sparkinfer_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
             quant_mode=quant_mode,
             w4a8_prepared=dynamic_w4a8_prepared,
             deterministic_output=deterministic_output,
+            pair_expert_rank=s.pair_expert_rank,
             swiglu_limit=swiglu_limit,
             swiglu_alpha=swiglu_alpha,
             swiglu_beta=swiglu_beta,

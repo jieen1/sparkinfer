@@ -453,6 +453,13 @@ def _w4a8_stage_bytes8(
 
 _PRODUCER_PAIRS_PER_WARP = 2
 _FC2_TILE_RECIP_GS_NUM = 6.0 * 448.0
+# See the matching constant/comment in kernels/micro.py: dynamic_down_scale's
+# fc2_down_alpha_value = down_alpha_value * (gs_value / tile_gs_value) is
+# unbounded by design and can overflow FP32 through the FC2 accumulation
+# when a tile's real magnitude greatly exceeds the caller's static gs_value
+# calibration (observed as Inf/NaN on Laguna-S-2.1's shape: E=256, K=3072,
+# I=1024, top_k=10 -- see issue for repro). Cap the ratio.
+_FC2_RESCALE_MAX = 1.0e4
 
 
 class DynamicLaunchParams:
@@ -1940,6 +1947,7 @@ class MoEDynamicKernelBackend:
         row_counts: cute.Tensor,  # expert row histogram [E]
         expert_write_rows: cute.Tensor,  # route/pack write cursors [E]
         expert_tile_base: cute.Tensor,  # compact physical-tile prefix [E + 1]
+        pair_expert_rank: cute.Tensor,  # [routed_rows] precomputed stable per-pair rank within its expert (deterministic_output only; dummy view otherwise)
         input_global_scale: cute.Tensor,  # [E] per-expert FC1 input scale
         alpha: cute.Tensor,
         down_alpha: cute.Tensor,
@@ -2151,6 +2159,7 @@ class MoEDynamicKernelBackend:
             launch_params,
             expert_write_rows,
             expert_tile_base,
+            pair_expert_rank,
             input_global_scale,
             alpha,
             down_alpha,
@@ -2267,6 +2276,7 @@ class MoEDynamicKernelBackend:
         launch_params: DynamicLaunchParams,
         expert_write_rows: cute.Tensor,
         expert_tile_base: cute.Tensor,
+        pair_expert_rank: cute.Tensor,
         input_global_scale: cute.Tensor,
         alpha: cute.Tensor,
         down_alpha: cute.Tensor,
@@ -2754,6 +2764,11 @@ class MoEDynamicKernelBackend:
                                 if cutlass.const_expr(self.direct_routing):
                                     row = Int32(0)
                                     phys_tile = pair_idx
+                                elif cutlass.const_expr(self.deterministic_output):
+                                    row = pair_expert_rank[pair_idx]
+                                    phys_tile = expert_tile_base[
+                                        expert_id
+                                    ] + row // Int32(self.tile_shape_mnk[0])
                                 else:
                                     row = atomic_add_global_i32(
                                         get_ptr_as_int64(expert_write_rows, expert_id),
@@ -3135,6 +3150,23 @@ class MoEDynamicKernelBackend:
                                 if cutlass.const_expr(self.direct_routing):
                                     row = Int32(0)
                                     phys_tile = pair_idx
+                                elif cutlass.const_expr(self.deterministic_output):
+                                    # Racing atomic_add_global_i32 makes which
+                                    # physical tile a token lands in depend on
+                                    # GPU scheduling, not just the input. That
+                                    # is invisible for the row math itself, but
+                                    # dynamic_down_scale's tile-level amax scan
+                                    # (see the tile_gs_value computation
+                                    # further below) is a function of *which*
+                                    # rows share a tile -- so a scheduling-
+                                    # dependent tile membership makes FC2
+                                    # quantization scheduling-dependent too.
+                                    # Read a precomputed, input-only-dependent
+                                    # stable rank instead of racing for one.
+                                    row = pair_expert_rank[pair_idx]
+                                    phys_tile = expert_tile_base[
+                                        expert_id
+                                    ] + row // Int32(self.tile_shape_mnk[0])
                                 else:
                                     row = atomic_add_global_i32(
                                         get_ptr_as_int64(expert_write_rows, expert_id),
@@ -5480,19 +5512,38 @@ class MoEDynamicKernelBackend:
                                     self.epilog_sync_barrier.arrive_and_wait()
                                     tile_amax = ld_shared_f32(reduce_scratch_addr)
                                     tile_gs_value = cutlass.Float32(0.0)
+                                    # A (near-)zero tile amax means this tile
+                                    # carries no real signal to recalibrate
+                                    # from. Previously the 1e-12 floor below
+                                    # was applied unconditionally and then
+                                    # inverted into fc2_down_alpha_value,
+                                    # turning "no signal" into a ~1e12x alpha
+                                    # blowup (NaN/Inf output at Laguna-S-2.1's
+                                    # shape: E=256,K=3072,I=1024,top_k=10 --
+                                    # see issue for repro). Only recalibrate
+                                    # when the scan actually found a positive
+                                    # amax; otherwise keep the static
+                                    # fc2_down_alpha_value/quant_gs_value
+                                    # defaults set above this epi_m loop.
                                     if tile_amax > cutlass.Float32(0.0):
                                         tile_gs_value = (
                                             cutlass.Float32(_FC2_TILE_RECIP_GS_NUM)
                                             / tile_amax
                                         )
-                                    tile_gs_value = fmax_f32(
-                                        tile_gs_value, cutlass.Float32(1.0e-12)
-                                    )
-                                    if tile_gs_value != cutlass.Float32(0.0):
-                                        fc2_down_alpha_value = down_alpha_value * (
-                                            gs_value / tile_gs_value
+                                        tile_gs_value = fmax_f32(
+                                            tile_gs_value, cutlass.Float32(1.0e-12)
                                         )
-                                    quant_gs_value = tile_gs_value
+                                        fc2_rescale_ratio = gs_value / tile_gs_value
+                                        if fc2_rescale_ratio > cutlass.Float32(
+                                            _FC2_RESCALE_MAX
+                                        ):
+                                            fc2_rescale_ratio = cutlass.Float32(
+                                                _FC2_RESCALE_MAX
+                                            )
+                                        fc2_down_alpha_value = (
+                                            down_alpha_value * fc2_rescale_ratio
+                                        )
+                                        quant_gs_value = tile_gs_value
                                     self.epilog_sync_barrier.arrive_and_wait()
                             quant_idx = Int32(tidx)
                             while quant_idx < epi_rows * sf_blocks_per_row:
