@@ -4668,7 +4668,13 @@ class PagedForwardKernel:
             elif const_expr(self.traits.num_warps_kv > 1):
                 cute.arch.cp_async_wait_group(1 if self.kv_is_fp8 else 0)
             else:
-                cute.arch.cp_async_wait_group(1)
+                # wait_group(1) here doesn't prove the about-to-be-consumed
+                # stage has actually landed given the rolling commit order --
+                # fully retire the preloaded K/V groups before the first
+                # stage is consumed. Interim correctness fix; see the
+                # num_warps_kv == 1 branch below for the matching
+                # consumer -> producer half of this race.
+                cute.arch.cp_async_wait_group(0)
             cute.arch.sync_threads()
 
             if const_expr(
@@ -5278,6 +5284,12 @@ class PagedForwardKernel:
                 next_tile_tokens = Int32(0)
                 next_page_idx = Int32(0)
                 if const_expr(not self.use_paged_k_tma):
+                    # A fast warp could otherwise start cp.async'ing into
+                    # this K stage while a slow warp is still reading it for
+                    # QK -- the barrier used to sit after the overwrite was
+                    # issued. Interim correctness fix; pairs with the
+                    # wait_group(0) below.
+                    cute.arch.sync_threads()
                     if const_expr(self.traits.num_warps_kv > 1):
                         if next_tile_base < chunk_end:
                             next_tile_limit = cutlass.select_(
@@ -5316,7 +5328,9 @@ class PagedForwardKernel:
                                 False,
                             )
                             cute.arch.cp_async_commit_group()
-                        cute.arch.cp_async_wait_group(1)
+                        # See the sync_threads() above this if/elif: pairs
+                        # with it to close the K-stage race (interim fix).
+                        cute.arch.cp_async_wait_group(0)
                         cute.arch.sync_threads()
                     elif const_expr(self.traits.num_warps_kv == 1):
                         if next_tile_base < chunk_end:
@@ -5356,7 +5370,11 @@ class PagedForwardKernel:
                                 False,
                             )
                             cute.arch.cp_async_commit_group()
-                        cute.arch.cp_async_wait_group(1)
+                        # num_warps_kv == 1 is the specialization this fix
+                        # was validated against (1000x fixed-input repeat,
+                        # 0 failures -- see notes/STATUS_dflash_acceptance.md
+                        # in qwen-sm120-runtime for the full A/B).
+                        cute.arch.cp_async_wait_group(0)
                         cute.arch.sync_threads()
 
                 if const_expr(self.use_paged_v_tma):
@@ -5804,6 +5822,11 @@ class PagedForwardKernel:
                         cute.arch.cp_async_commit_group()
                         prefetch_base += stage_tile_rows
                 elif const_expr(self.traits.num_warps_kv == 1):
+                    # Same consumer -> producer race as the K stage above: a
+                    # fast warp could start cp.async'ing into this V stage
+                    # while a slow warp is still doing PV against it.
+                    # Interim correctness fix.
+                    cute.arch.sync_threads()
                     if next_tile_base < chunk_end:
                         self._async_copy_paged_tile_permuted_128b(
                             mVBytes,
