@@ -1947,6 +1947,7 @@ class MoEDynamicKernelBackend:
         row_counts: cute.Tensor,  # expert row histogram [E]
         expert_write_rows: cute.Tensor,  # route/pack write cursors [E]
         expert_tile_base: cute.Tensor,  # compact physical-tile prefix [E + 1]
+        pair_expert_rank: cute.Tensor,  # [routed_rows] precomputed stable per-pair rank within its expert (deterministic_output only; dummy view otherwise)
         input_global_scale: cute.Tensor,  # [E] per-expert FC1 input scale
         alpha: cute.Tensor,
         down_alpha: cute.Tensor,
@@ -2158,6 +2159,7 @@ class MoEDynamicKernelBackend:
             launch_params,
             expert_write_rows,
             expert_tile_base,
+            pair_expert_rank,
             input_global_scale,
             alpha,
             down_alpha,
@@ -2274,6 +2276,7 @@ class MoEDynamicKernelBackend:
         launch_params: DynamicLaunchParams,
         expert_write_rows: cute.Tensor,
         expert_tile_base: cute.Tensor,
+        pair_expert_rank: cute.Tensor,
         input_global_scale: cute.Tensor,
         alpha: cute.Tensor,
         down_alpha: cute.Tensor,
@@ -2761,6 +2764,11 @@ class MoEDynamicKernelBackend:
                                 if cutlass.const_expr(self.direct_routing):
                                     row = Int32(0)
                                     phys_tile = pair_idx
+                                elif cutlass.const_expr(self.deterministic_output):
+                                    row = pair_expert_rank[pair_idx]
+                                    phys_tile = expert_tile_base[
+                                        expert_id
+                                    ] + row // Int32(self.tile_shape_mnk[0])
                                 else:
                                     row = atomic_add_global_i32(
                                         get_ptr_as_int64(expert_write_rows, expert_id),
@@ -3142,6 +3150,23 @@ class MoEDynamicKernelBackend:
                                 if cutlass.const_expr(self.direct_routing):
                                     row = Int32(0)
                                     phys_tile = pair_idx
+                                elif cutlass.const_expr(self.deterministic_output):
+                                    # Racing atomic_add_global_i32 makes which
+                                    # physical tile a token lands in depend on
+                                    # GPU scheduling, not just the input. That
+                                    # is invisible for the row math itself, but
+                                    # dynamic_down_scale's tile-level amax scan
+                                    # (see the tile_gs_value computation
+                                    # further below) is a function of *which*
+                                    # rows share a tile -- so a scheduling-
+                                    # dependent tile membership makes FC2
+                                    # quantization scheduling-dependent too.
+                                    # Read a precomputed, input-only-dependent
+                                    # stable rank instead of racing for one.
+                                    row = pair_expert_rank[pair_idx]
+                                    phys_tile = expert_tile_base[
+                                        expert_id
+                                    ] + row // Int32(self.tile_shape_mnk[0])
                                 else:
                                     row = atomic_add_global_i32(
                                         get_ptr_as_int64(expert_write_rows, expert_id),

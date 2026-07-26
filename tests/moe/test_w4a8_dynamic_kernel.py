@@ -201,6 +201,10 @@ def _run_w4a8_dynamic(
     row_counts = torch.zeros(E, dtype=torch.int32, device=device)
     expert_write_rows = torch.zeros(E, dtype=torch.int32, device=device)
     expert_tile_base = torch.zeros(E + 1, dtype=torch.int32, device=device)
+    # w4a8 exercises the non-deterministic atomic row-claim path (the
+    # kernel never reads pair_expert_rank there); a zeroed placeholder is a
+    # safe stand-in matching the launch ABI.
+    pair_expert_rank = torch.zeros(rows_padded, dtype=torch.int32, device=device)
     token_map = torch.zeros(rows_padded, dtype=torch.int32, device=device)
     token_weights = torch.zeros(rows_padded, dtype=torch.float32, device=device)
     # The repacked-weight arguments are part of the launch ABI even when this
@@ -264,6 +268,7 @@ def _run_w4a8_dynamic(
         fake_ptr_u8(), fake_ptr_u8(), fake_ptr_u8(), fake_ptr_u8(),
         fake_ptr_u32(), fake_ptr_u32(), fake_ptr_u32(), fake_ptr_u32(),
         _fake_i32((E,)), _fake_i32((E,)), _fake_i32((E + 1,)),
+        fake_ptr_i32(),
         _fake_f32((E,)), _fake_f32((E,)), _fake_f32((E,)), _fake_f32((E,)),
         make_ptr(cutlass.BFloat16, 16, cute.AddressSpace.gmem, assumed_align=16),
         fake_ptr_i32(),
@@ -315,6 +320,7 @@ def _run_w4a8_dynamic(
         _gptr(cutlass.Uint32, repacked_sentinel),
         _gptr(cutlass.Uint32, repacked_sentinel),
         row_counts, expert_write_rows, expert_tile_base,
+        _gptr(cutlass.Int32, pair_expert_rank, 4),
         ones, ones, ones, ones,
         _gptr(cutlass.BFloat16, scatter_output),
         _gptr(cutlass.Int32, token_map, 4),
@@ -638,6 +644,7 @@ def _run_w4a8_dynamic(
                 _gptr(cutlass.Uint32, repacked_sentinel),
                 _gptr(cutlass.Uint32, repacked_sentinel),
                 row_counts, expert_write_rows, expert_tile_base,
+                _gptr(cutlass.Int32, pair_expert_rank, 4),
                 ones, ones, ones, ones,
                 _gptr(cutlass.BFloat16, scatter_output),
                 _gptr(cutlass.Int32, token_map, 4),
@@ -881,6 +888,10 @@ def test_w4a8_dynamic_graph_replay_tracks_routing_updates() -> None:
     row_counts = torch.zeros(E, dtype=torch.int32, device=device)
     expert_write_rows = torch.zeros(E, dtype=torch.int32, device=device)
     expert_tile_base = torch.zeros(E + 1, dtype=torch.int32, device=device)
+    # w4a8 exercises the non-deterministic atomic row-claim path (the
+    # kernel never reads pair_expert_rank there); a zeroed placeholder is a
+    # safe stand-in matching the launch ABI.
+    pair_expert_rank = torch.zeros(rows_padded, dtype=torch.int32, device=device)
     token_map = torch.zeros(rows_padded, dtype=torch.int32, device=device)
     token_weights = torch.zeros(rows_padded, dtype=torch.float32, device=device)
     scatter_output = torch.zeros(m, K, dtype=torch.bfloat16, device=device)
@@ -926,6 +937,7 @@ def test_w4a8_dynamic_graph_replay_tracks_routing_updates() -> None:
         fake_ptr_u8(), fake_ptr_u8(), fake_ptr_u8(), fake_ptr_u8(),
         fake_ptr_u32(), fake_ptr_u32(), fake_ptr_u32(), fake_ptr_u32(),
         _fake_i32((E,)), _fake_i32((E,)), _fake_i32((E + 1,)),
+        fake_ptr_i32(),
         _fake_f32((E,)), _fake_f32((E,)), _fake_f32((E,)), _fake_f32((E,)),
         make_ptr(cutlass.BFloat16, 16, cute.AddressSpace.gmem, assumed_align=16),
         fake_ptr_i32(),
@@ -967,6 +979,7 @@ def test_w4a8_dynamic_graph_replay_tracks_routing_updates() -> None:
             _gptr(cutlass.Uint32, repacked_sentinel),
             _gptr(cutlass.Uint32, repacked_sentinel),
             row_counts, expert_write_rows, expert_tile_base,
+            _gptr(cutlass.Int32, pair_expert_rank, 4),
             ones, ones, ones, ones,
             _gptr(cutlass.BFloat16, scatter_output),
             _gptr(cutlass.Int32, token_map, 4),
