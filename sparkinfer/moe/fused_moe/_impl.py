@@ -9245,7 +9245,11 @@ def sparkinfer_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
             # argsort/bincount/indexing all accept flat_ids' native dtype
             # (int32 or int64) directly -- no int64 normalization needed.
             order = torch.argsort(flat_ids, stable=True)
-            counts = torch.bincount(flat_ids, minlength=weight_E)
+            # torch.bincount does an implicit device-to-host sync that is
+            # illegal during CUDA graph capture.  scatter_add_ is fully
+            # device-side and graph-safe.
+            counts = torch.zeros(weight_E, dtype=torch.int64, device=flat_ids.device)
+            counts.scatter_add_(0, flat_ids.long(), torch.ones(flat_ids.shape[0], dtype=torch.int64, device=flat_ids.device))
             group_start = torch.cumsum(counts, 0) - counts
             rank_in_sorted_order = (
                 torch.arange(flat_ids.shape[0], device=flat_ids.device)

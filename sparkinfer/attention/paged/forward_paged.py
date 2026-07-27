@@ -1812,8 +1812,8 @@ def _literal_qk_mma_into_sfrag_plane_fp8_raw_row0_1x1(
         b_f8_0, b_f8_1, b_f8_2, b_f8_3 = ldmatrix_m8n8x4_b16(k_addr)
         b_f8_left0 = frag_layout_swizzle_16b_to_8b(b_f8_0)
         b_f8_left1 = frag_layout_swizzle_16b_to_8b(b_f8_2)
-        b0, b1 = fp8x4_e4m3_to_bfloat2x2_native_sm120(b_f8_left0)
-        b2, b3 = fp8x4_e4m3_to_bfloat2x2_native_sm120(b_f8_left1)
+        b0, b1 = fp8x4_e4m3_to_bfloat2x2_via_f16(b_f8_left0)
+        b2, b3 = fp8x4_e4m3_to_bfloat2x2_via_f16(b_f8_left1)
         d0, d1, d2, d3, d4, d5, d6, d7 = bf16_mma_m16n16k16_f32(
             s_frag[0, 0, 0],
             s_frag[0, 0, 1],
@@ -1851,8 +1851,8 @@ def _literal_qk_mma_into_sfrag_plane_fp8_raw_row0_1x1(
         ) - Int32(16 * upcast_stride_q)
         b_f8_right0 = frag_layout_swizzle_16b_to_8b(b_f8_1)
         b_f8_right1 = frag_layout_swizzle_16b_to_8b(b_f8_3)
-        b0, b1 = fp8x4_e4m3_to_bfloat2x2_native_sm120(b_f8_right0)
-        b2, b3 = fp8x4_e4m3_to_bfloat2x2_native_sm120(b_f8_right1)
+        b0, b1 = fp8x4_e4m3_to_bfloat2x2_via_f16(b_f8_right0)
+        b2, b3 = fp8x4_e4m3_to_bfloat2x2_via_f16(b_f8_right1)
         d0, d1, d2, d3, d4, d5, d6, d7 = bf16_mma_m16n16k16_f32(
             s_frag[0, 0, 0],
             s_frag[0, 0, 1],
@@ -2492,8 +2492,8 @@ def _literal_pv_mma_into_ofrag_plane_fp8_raw_row0_1x1(
             b_f8_0, b_f8_1 = ldmatrix_m8n8x4_trans_right_half_b16(v_addr)
         b_f8_0 = frag_layout_swizzle_16b_to_8b_trans(b_f8_0)
         b_f8_1 = frag_layout_swizzle_16b_to_8b_trans(b_f8_1)
-        b0, b1 = fp8x4_e4m3_to_bfloat2x2_native_sm120(b_f8_0)
-        b2, b3 = fp8x4_e4m3_to_bfloat2x2_native_sm120(b_f8_1)
+        b0, b1 = fp8x4_e4m3_to_bfloat2x2_via_f16(b_f8_0)
+        b2, b3 = fp8x4_e4m3_to_bfloat2x2_via_f16(b_f8_1)
         tmp = b1
         b1 = b2
         b2 = tmp
