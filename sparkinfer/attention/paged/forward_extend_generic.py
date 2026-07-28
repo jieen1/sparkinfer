@@ -5328,7 +5328,15 @@ class PagedForwardKernel:
                         pipeline_k.consumer_try_wait(kv_consumer_state),
                     )
             elif const_expr(self.traits.num_warps_kv > 1):
-                cute.arch.cp_async_wait_group(1 if self.kv_is_fp8 else 0)
+                # wait_group(1 if fp8 else 0) here doesn't prove the
+                # about-to-be-consumed stage has actually landed given the
+                # rolling commit order -- same race as the num_warps_kv == 1
+                # branch below, just never independently audited for the
+                # multi-KV-warp case. Fully retire the preloaded K/V groups
+                # before the first stage is consumed. Interim correctness
+                # fix; see the num_warps_kv == 1 branch for the matching
+                # consumer -> producer half of this race.
+                cute.arch.cp_async_wait_group(0)
             else:
                 # wait_group(1) here doesn't prove the about-to-be-consumed
                 # stage has actually landed given the rolling commit order --
