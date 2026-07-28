@@ -203,6 +203,51 @@ def _assert_bitwise_stable(outs: list[torch.Tensor], *, label: str):
         )
 
 
+@pytest.mark.parametrize("num_pairs", [1, 160, 256])
+def test_small_stable_expert_ranks_match_pair_order(num_pairs: int):
+    """The decode rank fast path must exactly preserve stable pair ordering."""
+    device = require_sparkinfer()
+    from sparkinfer.moe._shared.routing import stable_expert_ranks_small
+
+    ids_cpu = (torch.arange(num_pairs, dtype=torch.int32) * 17 + 3) % 23
+    ids = ids_cpu.to(device).contiguous()
+    ranks = torch.empty(num_pairs, dtype=torch.int32, device=device)
+    assert stable_expert_ranks_small(ids, ranks)
+
+    expected = torch.tensor(
+        [int((ids_cpu[:index] == ids_cpu[index]).sum()) for index in range(num_pairs)],
+        dtype=torch.int32,
+    )
+    torch.testing.assert_close(ranks.cpu(), expected)
+
+
+def test_small_stable_expert_ranks_cuda_graph_replay_tracks_ids():
+    """The fast path is capture-safe and reads the replay-time route IDs."""
+    device = require_sparkinfer()
+    from sparkinfer.moe._shared.routing import stable_expert_ranks_small
+
+    num_pairs = 160
+    ids = (torch.arange(num_pairs, dtype=torch.int32, device=device) % 11).contiguous()
+    ranks = torch.empty(num_pairs, dtype=torch.int32, device=device)
+    assert stable_expert_ranks_small(ids, ranks)  # compile before capture
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        assert stable_expert_ranks_small(ids, ranks)
+
+    ids.copy_((torch.arange(num_pairs, dtype=torch.int32, device=device) * 7 + 1) % 19)
+    graph.replay()
+    torch.cuda.synchronize()
+
+    ids_cpu = ids.cpu()
+    expected = torch.tensor(
+        [int((ids_cpu[:index] == ids_cpu[index]).sum()) for index in range(num_pairs)],
+        dtype=torch.int32,
+    )
+    torch.testing.assert_close(ranks.cpu(), expected)
+
+
 def test_dynamic_moe_deterministic_output_is_bitwise_stable_m256(laguna_shape_experts):
     """Fast primary regression case: M=256 already reliably reproduces the
     bug at default (multi-CTA) scheduling, per the diagnosed M-dependent

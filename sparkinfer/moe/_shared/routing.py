@@ -5,6 +5,67 @@ import triton.language as tl
 import torch
 
 
+_SMALL_STABLE_RANK_MAX_PAIRS = 256
+
+
+@triton.jit
+def _stable_expert_rank_small_kernel(
+    expert_ids_ptr,
+    ranks_ptr,
+    NUM_PAIRS: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """Compute each pair's stable in-expert rank for a small routing row.
+
+    One program owns one routed pair.  The fixed, bounded comparison domain is
+    intentionally cheaper than a general-purpose sort for decode-sized MoE
+    batches, while preserving the original pair-index ordering exactly.
+    """
+    pair_idx = tl.program_id(0)
+    offsets = tl.arange(0, BLOCK)
+    ids = tl.load(expert_ids_ptr + offsets, mask=offsets < NUM_PAIRS, other=-1)
+    pair_expert = tl.load(expert_ids_ptr + pair_idx)
+    earlier_same_expert = (offsets < pair_idx) & (ids == pair_expert)
+    rank = tl.sum(earlier_same_expert.to(tl.int32), axis=0)
+    tl.store(ranks_ptr + pair_idx, rank)
+
+
+def stable_expert_ranks_small(
+    expert_ids: torch.Tensor,
+    ranks: torch.Tensor,
+) -> bool:
+    """Fill stable ranks for decode-sized routing, returning ``False`` if large.
+
+    A rank is the number of equal expert IDs preceding a routed pair.  The
+    dynamic MoE kernel consumes it to choose stable physical rows.  General
+    batches keep the existing sort-based path; the dedicated kernel only
+    handles the latency-sensitive bounded case (at most 256 routed pairs).
+    """
+    num_pairs = expert_ids.numel()
+    if num_pairs > _SMALL_STABLE_RANK_MAX_PAIRS:
+        return False
+    if expert_ids.ndim != 1 or ranks.ndim != 1:
+        raise ValueError("expert_ids and ranks must be flat tensors")
+    if ranks.numel() < num_pairs:
+        raise ValueError("ranks does not have enough capacity")
+    if not expert_ids.is_cuda or not ranks.is_cuda:
+        raise ValueError("stable_expert_ranks_small requires CUDA tensors")
+    if ranks.dtype != torch.int32:
+        raise ValueError(f"ranks must be int32, got {ranks.dtype}")
+    if not expert_ids.is_contiguous() or not ranks.is_contiguous():
+        raise ValueError("stable_expert_ranks_small requires contiguous tensors")
+
+    block = triton.next_power_of_2(max(num_pairs, 1))
+    _stable_expert_rank_small_kernel[(num_pairs,)](
+        expert_ids,
+        ranks,
+        NUM_PAIRS=num_pairs,
+        BLOCK=block,
+        num_warps=4,
+    )
+    return True
+
+
 @triton.jit
 def _route_topk_kernel(
     logits_ptr,
