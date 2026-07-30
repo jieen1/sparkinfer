@@ -1635,10 +1635,16 @@ def _nvfp4_dynamic_direct_candidate(
 ) -> bool:
     """Whether tiny A4 execution can bypass grouped route compaction."""
 
+    deterministic_pair_direct = _env_flag(
+        "SPARKINFER_DYNAMIC_DETERMINISTIC_PAIR_DIRECT", default=False
+    )
+    direct_limit = _DIRECT_ROUTING_MAX_ROUTED_ROWS
+    if deterministic_output and deterministic_pair_direct:
+        direct_limit = _DETERMINISTIC_PAIR_DIRECT_MAX_ROUTED_ROWS
     return bool(
         _normalize_quant_mode(quant_mode) == "nvfp4"
         and activation == "silu"
-        and 0 < routed_rows <= _DIRECT_ROUTING_MAX_ROUTED_ROWS
+        and 0 < routed_rows <= direct_limit
         and _select_dynamic_tile_mn(
             routed_rows,
             n,
@@ -1648,7 +1654,7 @@ def _nvfp4_dynamic_direct_candidate(
         )
         == (16, 128)
         and _dynamic_work_source() != "ready_queue"
-        and not deterministic_output
+        and (not deterministic_output or deterministic_pair_direct)
     )
 
 
@@ -1744,6 +1750,7 @@ _MICRO_MAX_TOKENS = 8
 # pair-direct routing wins through M=4 for the common top-k=8 regime.
 _W4A8_DECODE_MAX_ROUTED_ROWS = 64
 _DIRECT_ROUTING_MAX_ROUTED_ROWS = 32
+_DETERMINISTIC_PAIR_DIRECT_MAX_ROUTED_ROWS = 160
 _MICRO_DYNAMIC_CUTOVER_PAIRS_CACHE: Dict[str, int] = {}
 _DYNAMIC_MULTICTA_CACHE: bool | None = None
 _DYNAMIC_DOWN_SCALE_CACHE: bool | None = None
