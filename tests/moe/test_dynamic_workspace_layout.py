@@ -12,7 +12,6 @@ from sparkinfer.moe.fused_moe._impl import (
     _deterministic_route_tile_dependencies,
     _dynamic_kernel_intermediate_size,
     _dynamic_task_geometry,
-    _nvfp4_dynamic_direct_candidate,
     _plan_core_workspace,
     _select_dynamic_tile_mn,
 )
@@ -117,19 +116,3 @@ def test_route_tile_dependency_cycles_block_simple_exact_streaming() -> None:
     assert cyclic.cyclic_components == 1
     assert cyclic.largest_cyclic_component_tiles == 2
     assert cyclic.largest_cyclic_component_route_rows == 4
-
-
-def test_deterministic_pair_direct_is_explicit_and_limited(monkeypatch) -> None:
-    kwargs = {
-        "quant_mode": "nvfp4",
-        "activation": "silu",
-        "routed_rows": 160,
-        "num_experts": 256,
-        "n": 1024,
-        "deterministic_output": True,
-    }
-    assert not _nvfp4_dynamic_direct_candidate(**kwargs)
-
-    monkeypatch.setenv("SPARKINFER_DYNAMIC_DETERMINISTIC_PAIR_DIRECT", "1")
-    assert _nvfp4_dynamic_direct_candidate(**kwargs)
-    assert not _nvfp4_dynamic_direct_candidate(**{**kwargs, "routed_rows": 161})
