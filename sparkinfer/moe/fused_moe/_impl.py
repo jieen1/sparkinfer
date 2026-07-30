@@ -2818,11 +2818,213 @@ def _allocate_arena_tensor(
 
 
 def _core_workspace_nbytes(plan: _TPCoreWorkspacePlan) -> int:
-    arena_nbytes = 0
+    return _core_workspace_view_map(plan)[-1]["end_byte"] if plan.tensor_specs else 0
+
+
+def _core_workspace_view_map(plan: _TPCoreWorkspacePlan) -> tuple[dict[str, object], ...]:
+    """Describe the byte layout of a core arena without allocating CUDA memory.
+
+    Dynamic MoE keeps all its workspace tensors as views over one opaque
+    uint8 allocation. Returning this map lets capacity diagnostics attribute
+    that allocation (especially deterministic ``route_output``) exactly,
+    without depending on allocator internals or materializing a workspace.
+    """
+    offset = 0
+    views: list[dict[str, object]] = []
     for spec in plan.tensor_specs:
-        arena_nbytes = align_up(arena_nbytes, max(16, _dtype_nbytes(spec.dtype)))
-        arena_nbytes += _tensor_numel(spec.shape) * _dtype_nbytes(spec.dtype)
-    return int(arena_nbytes)
+        offset = align_up(offset, max(16, _dtype_nbytes(spec.dtype)))
+        nbytes = _tensor_numel(spec.shape) * _dtype_nbytes(spec.dtype)
+        views.append(
+            {
+                "name": spec.name,
+                "shape": spec.shape,
+                "dtype": str(spec.dtype),
+                "offset_byte": offset,
+                "nbytes": nbytes,
+                "end_byte": offset + nbytes,
+            }
+        )
+        offset += nbytes
+    return tuple(views)
+
+
+@dataclass(frozen=True)
+class _DeterministicRouteLiveness:
+    """Peak route rows retained by a producer/reducer schedule.
+
+    A route row becomes live when its expert tile has emitted its BF16 result.
+    A token's rows become reusable only after every top-k slot for that token
+    is present, because the reducer must then consume the slots in their
+    original order. This is a CPU-only schedule model; it makes no claim that
+    a candidate schedule is implementable by the persistent CUDA kernel.
+    """
+
+    peak_live_routes: int
+    emitted_routes: int
+    consumed_tokens: int
+    final_live_routes: int
+
+
+@dataclass(frozen=True)
+class _DeterministicRouteTileDependencies:
+    """Dependency-cycle summary for exact-order route reduction by tile."""
+
+    active_tiles: int
+    dependency_edges: int
+    cyclic_components: int
+    largest_cyclic_component_tiles: int
+    largest_cyclic_component_route_rows: int
+
+
+def _deterministic_route_liveness(
+    *,
+    num_tokens: int,
+    num_topk: int,
+    producer_batches: Sequence[Sequence[int]],
+) -> _DeterministicRouteLiveness:
+    """Model exact-order route-output retention for a proposed tile schedule.
+
+    ``producer_batches`` must retain the actual producer completion boundary:
+    rows in one batch are all written before their matching reducer launch can
+    run. The model intentionally rejects duplicate or out-of-range pair
+    indices so a trace can be used as liveness evidence without silently
+    hiding a routing error.
+    """
+    if num_tokens <= 0 or num_topk <= 0:
+        raise ValueError("num_tokens and num_topk must be positive")
+
+    routed_rows = num_tokens * num_topk
+    emitted: set[int] = set()
+    completed_routes = [0] * num_tokens
+    live_routes = 0
+    peak_live_routes = 0
+    consumed_tokens = 0
+
+    for batch in producer_batches:
+        completed_tokens: set[int] = set()
+        for pair_index in batch:
+            if pair_index < 0 or pair_index >= routed_rows:
+                raise ValueError(f"route pair index {pair_index} is out of range")
+            if pair_index in emitted:
+                raise ValueError(f"route pair index {pair_index} was emitted twice")
+            emitted.add(pair_index)
+            live_routes += 1
+            token_index = pair_index // num_topk
+            completed_routes[token_index] += 1
+            if completed_routes[token_index] == num_topk:
+                completed_tokens.add(token_index)
+
+        peak_live_routes = max(peak_live_routes, live_routes)
+        for _token_index in completed_tokens:
+            # The reducer sees the original contiguous slot order for this
+            # token, so freeing happens only after the complete ordered group.
+            live_routes -= num_topk
+            consumed_tokens += 1
+
+    return _DeterministicRouteLiveness(
+        peak_live_routes=peak_live_routes,
+        emitted_routes=len(emitted),
+        consumed_tokens=consumed_tokens,
+        final_live_routes=live_routes,
+    )
+
+
+def _deterministic_route_tile_dependencies(
+    *,
+    physical_to_pair: Sequence[int],
+    num_tokens: int,
+    num_topk: int,
+    tile_m: int,
+) -> _DeterministicRouteTileDependencies:
+    """Summarize the tile dependency graph induced by exact top-k order.
+
+    ``physical_to_pair`` is the post-launch ``token_map`` view: physical row
+    to token-major route-pair index. For every token, the tile containing slot
+    ``k - 1`` must precede the tile containing slot ``k`` if a streaming
+    reducer is to preserve the original sum order without retaining slot ``k``.
+    Cyclic components prove that a simple tile-topological launch order cannot
+    provide that property for all of their rows.
+    """
+    if num_tokens <= 0 or num_topk <= 0 or tile_m <= 0:
+        raise ValueError("num_tokens, num_topk, and tile_m must be positive")
+
+    routed_rows = num_tokens * num_topk
+    pair_to_tile = [-1] * routed_rows
+    tile_route_rows: dict[int, int] = {}
+    for physical_row, pair_index in enumerate(physical_to_pair):
+        if pair_index < 0 or pair_index >= routed_rows:
+            continue
+        if pair_to_tile[pair_index] != -1:
+            raise ValueError(f"route pair index {pair_index} appears more than once")
+        tile_index = physical_row // tile_m
+        pair_to_tile[pair_index] = tile_index
+        tile_route_rows[tile_index] = tile_route_rows.get(tile_index, 0) + 1
+    missing = [pair_index for pair_index, tile in enumerate(pair_to_tile) if tile < 0]
+    if missing:
+        raise ValueError(f"route pair index {missing[0]} is missing from token_map")
+
+    edges: set[tuple[int, int]] = set()
+    for token_index in range(num_tokens):
+        base = token_index * num_topk
+        for slot in range(1, num_topk):
+            previous_tile = pair_to_tile[base + slot - 1]
+            current_tile = pair_to_tile[base + slot]
+            if previous_tile != current_tile:
+                edges.add((previous_tile, current_tile))
+
+    adjacency = {tile_index: set() for tile_index in tile_route_rows}
+    for source, target in edges:
+        adjacency[source].add(target)
+    indices: dict[int, int] = {}
+    lowlinks: dict[int, int] = {}
+    stack: list[int] = []
+    on_stack: set[int] = set()
+    next_index = 0
+    cyclic_components = 0
+    largest_component_tiles = 0
+    largest_component_route_rows = 0
+
+    def visit(tile_index: int) -> None:
+        nonlocal next_index, cyclic_components
+        nonlocal largest_component_tiles, largest_component_route_rows
+        indices[tile_index] = next_index
+        lowlinks[tile_index] = next_index
+        next_index += 1
+        stack.append(tile_index)
+        on_stack.add(tile_index)
+        for target in adjacency[tile_index]:
+            if target not in indices:
+                visit(target)
+                lowlinks[tile_index] = min(lowlinks[tile_index], lowlinks[target])
+            elif target in on_stack:
+                lowlinks[tile_index] = min(lowlinks[tile_index], indices[target])
+        if lowlinks[tile_index] != indices[tile_index]:
+            return
+        component: list[int] = []
+        while True:
+            member = stack.pop()
+            on_stack.remove(member)
+            component.append(member)
+            if member == tile_index:
+                break
+        if len(component) > 1:
+            cyclic_components += 1
+            largest_component_tiles = max(largest_component_tiles, len(component))
+            largest_component_route_rows = max(
+                largest_component_route_rows,
+                sum(tile_route_rows[member] for member in component),
+            )
+
+    for tile_index in adjacency:
+        if tile_index not in indices:
+            visit(tile_index)
+    return _DeterministicRouteTileDependencies(
+        active_tiles=len(tile_route_rows),
+        dependency_edges=len(edges),
+        cyclic_components=cyclic_components,
+        largest_cyclic_component_tiles=largest_component_tiles,
+        largest_cyclic_component_route_rows=largest_component_route_rows,
+    )
 
 
 def _emit_core_workspace_stats(
