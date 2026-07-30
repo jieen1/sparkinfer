@@ -2848,6 +2848,177 @@ def _core_workspace_view_map(plan: _TPCoreWorkspacePlan) -> tuple[dict[str, obje
     return tuple(views)
 
 
+# This records the persistent dynamic kernel's dataflow, not a proposed
+# replacement schedule.  Capacity diagnostics consume it with the byte view
+# map so a future bounded route-output design starts from explicit producer /
+# consumer and reuse boundaries instead of inferring them from tensor names.
+_DYNAMIC_CORE_VIEW_LIFECYCLE = {
+    "row_counts": (
+        "phase 0 route counting",
+        "phase 1 route placement and task planning",
+        "one dynamic MoE launch",
+    ),
+    "barrier_count": (
+        "persistent-kernel phase barriers",
+        "persistent-kernel phase barriers",
+        "one dynamic MoE launch",
+    ),
+    "barrier_epoch": (
+        "persistent-kernel phase barriers",
+        "persistent-kernel phase barriers",
+        "one dynamic MoE launch",
+    ),
+    "token_map": (
+        "phase 1 route placement",
+        "FC1/FC2 task execution and route-output diagnostics",
+        "from route placement through FC2 completion",
+    ),
+    "token_weights": (
+        "phase 1 route placement",
+        "routed expert output weighting",
+        "from route placement through FC2 completion",
+    ),
+    "route_output": (
+        "FC2 writes indexed by token-major route pair",
+        "fixed-order dynamic top-k reduction",
+        "from each FC2 store until its token's ordered top-k reduction",
+    ),
+    "materialized_intermediate": (
+        "dynamic FC1/activation materialization",
+        "dynamic FC2",
+        "between FC1/activation and matching FC2 work",
+    ),
+    "packed_input": (
+        "phase 1 activation quantization",
+        "dynamic FC1",
+        "from activation packing through FC1 completion",
+    ),
+    "packed_input_scale": (
+        "phase 1 activation quantization",
+        "dynamic FC1 dequantization",
+        "from activation packing through FC1 completion",
+    ),
+    "expert_write_rows": (
+        "phase 1 route placement",
+        "expert tile/task planning",
+        "one dynamic MoE launch",
+    ),
+    "expert_tile_base": (
+        "phase 1 route placement",
+        "FC1/FC2 task indexing",
+        "from route placement through FC2 completion",
+    ),
+    "pair_expert_rank": (
+        "host-side stable expert rank",
+        "deterministic phase 1 route placement",
+        "from rank preparation through route placement",
+    ),
+    "input_gs": (
+        "dynamic input quantization",
+        "dynamic FC1 quantization",
+        "one dynamic MoE launch",
+    ),
+    "down_input_scale": (
+        "dynamic FC1/activation scale reduction",
+        "dynamic FC2 quantization",
+        "between FC1/activation and matching FC2 work",
+    ),
+    "pair_head": (
+        "persistent-kernel route producer",
+        "persistent-kernel route producer",
+        "one dynamic MoE launch",
+    ),
+    "producers_done_count": (
+        "persistent-kernel route producer",
+        "persistent-kernel task consumer",
+        "one dynamic MoE launch",
+    ),
+    "all_work_published": (
+        "persistent-kernel route producer",
+        "persistent-kernel task consumer",
+        "one dynamic MoE launch",
+    ),
+    "task_head": (
+        "persistent-kernel task consumer",
+        "persistent-kernel task consumer",
+        "one dynamic MoE launch",
+    ),
+    "task_tail": (
+        "persistent-kernel task producer",
+        "persistent-kernel task consumer",
+        "one dynamic MoE launch",
+    ),
+    "task_ready": (
+        "persistent-kernel task producer",
+        "persistent-kernel task consumer",
+        "one dynamic MoE launch",
+    ),
+    "task_expert": (
+        "persistent-kernel task producer",
+        "persistent-kernel task consumer",
+        "one dynamic MoE launch",
+    ),
+    "task_m_tile": (
+        "persistent-kernel task producer",
+        "persistent-kernel task consumer",
+        "one dynamic MoE launch",
+    ),
+    "task_slice_begin": (
+        "persistent-kernel task producer",
+        "persistent-kernel task consumer",
+        "one dynamic MoE launch",
+    ),
+    "task_slice_count": (
+        "persistent-kernel task producer",
+        "persistent-kernel task consumer",
+        "one dynamic MoE launch",
+    ),
+    "task_valid_rows": (
+        "persistent-kernel task producer",
+        "persistent-kernel task consumer",
+        "one dynamic MoE launch",
+    ),
+    "tile_write_count": (
+        "dynamic FC2 tile completion",
+        "dynamic FC2 tile synchronization",
+        "one dynamic MoE launch",
+    ),
+}
+
+
+def _dynamic_core_workspace_liveness_map(
+    plan: _TPCoreWorkspacePlan,
+) -> tuple[dict[str, object], ...]:
+    """Annotate dynamic core-arena views with their current dataflow bounds.
+
+    This is intentionally descriptive: it does not claim that a view can be
+    recycled at an earlier boundary.  In particular, ``route_output`` remains
+    live until the separate fixed-order top-k reduction consumes each token's
+    complete route group.
+    """
+    if plan.implementation != "dynamic":
+        raise ValueError(
+            "dynamic core workspace liveness is only defined for the dynamic plan"
+        )
+    views: list[dict[str, object]] = []
+    for view in _core_workspace_view_map(plan):
+        try:
+            producer, consumer, lifetime = _DYNAMIC_CORE_VIEW_LIFECYCLE[view["name"]]
+        except KeyError as exc:
+            raise RuntimeError(
+                f"missing dynamic workspace lifecycle for {view['name']!r}"
+            ) from exc
+        views.append(
+            {
+                **view,
+                "producer": producer,
+                "consumer": consumer,
+                "lifetime": lifetime,
+            }
+        )
+    return tuple(views)
+
+
 @dataclass(frozen=True)
 class _DeterministicRouteLiveness:
     """Peak route rows retained by a producer/reducer schedule.

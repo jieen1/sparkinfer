@@ -7,6 +7,7 @@ import torch
 from sparkinfer.moe.fused_moe._impl import (
     _core_workspace_nbytes,
     _core_workspace_view_map,
+    _dynamic_core_workspace_liveness_map,
     _deterministic_route_liveness,
     _deterministic_route_tile_dependencies,
     _dynamic_kernel_intermediate_size,
@@ -56,6 +57,17 @@ def test_m8192_deterministic_dynamic_arena_is_explicitly_attributed() -> None:
     assert views["packed_input"]["nbytes"] == 175_964_160
     assert views["packed_input_scale"]["nbytes"] == 21_995_520
     assert _core_workspace_nbytes(plan) == 703_493_020
+
+    liveness = {
+        view["name"]: view for view in _dynamic_core_workspace_liveness_map(plan)
+    }
+    assert liveness["route_output"] == {
+        **views["route_output"],
+        "producer": "FC2 writes indexed by token-major route pair",
+        "consumer": "fixed-order dynamic top-k reduction",
+        "lifetime": "from each FC2 store until its token's ordered top-k reduction",
+    }
+    assert set(liveness) == set(views)
 
 
 def test_deterministic_route_liveness_requires_complete_topk_groups() -> None:
