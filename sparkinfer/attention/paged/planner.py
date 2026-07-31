@@ -322,11 +322,10 @@ def _is_laguna_fp8_gqa6_analytic_decode_graph(
     return bool(
         q_dtype == torch.bfloat16
         and kv_dtype == _FP8_KV_DTYPE
-        and int(num_q_heads) == 24
-        and int(num_kv_heads) == 4
+        and int(num_q_heads) // max(int(num_kv_heads), 1) == 6
         and int(head_dim_qk) == 128
         and int(head_dim_vo) == 128
-        and int(page_size) == 128
+        and int(page_size) in (64, 128)
         and 1 <= int(batch) <= 8
         and int(window_left) < 0
         and tuple(torch.cuda.get_device_capability(device)) == (12, 0)
@@ -382,11 +381,10 @@ def _is_laguna_fp8_gqa6_full_prefill_graph(
     return bool(
         q_dtype == torch.bfloat16
         and kv_dtype == _FP8_KV_DTYPE
-        and int(num_q_heads) == 24
-        and int(num_kv_heads) == 4
+        and int(num_q_heads) // max(int(num_kv_heads), 1) == 6
         and int(head_dim_qk) == 128
         and int(head_dim_vo) == 128
-        and int(page_size) == 128
+        and int(page_size) in (64, 128)
         and 1 <= int(batch) <= 8
         and int(window_left) < 0
         and tuple(torch.cuda.get_device_capability(device)) == (12, 0)

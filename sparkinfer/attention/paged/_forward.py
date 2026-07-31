@@ -439,11 +439,9 @@ def _use_laguna_verify_forward_kernel(
         and plan.split_kv
         and not plan.msa_block_sparse
         and plan.window_left < 0
-        and plan.page_size == 128
+        and plan.page_size in (64, 128)
         and plan.dtype == torch.bfloat16
         and plan.kv_dtype == torch.float8_e4m3fn
-        and plan.num_q_heads == 24
-        and plan.num_kv_heads == 4
         and plan.gqa_group_size == 6
         and plan.head_dim_qk == 128
         and plan.head_dim_vo == 128
@@ -478,11 +476,9 @@ def _use_laguna_decode_analytic_kernel(
         and plan.split_kv
         and not plan.msa_block_sparse
         and plan.window_left < 0
-        and plan.page_size == 128
+        and plan.page_size in (64, 128)
         and plan.dtype == torch.bfloat16
         and plan.kv_dtype == torch.float8_e4m3fn
-        and plan.num_q_heads == 24
-        and plan.num_kv_heads == 4
         and plan.gqa_group_size == 6
         and plan.head_dim_qk == 128
         and plan.head_dim_vo == 128
