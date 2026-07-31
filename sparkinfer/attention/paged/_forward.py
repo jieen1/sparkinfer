@@ -111,10 +111,15 @@ def _resolve_native_fp8_attention_mma_flags(
         ):
             # Mid-batch short-chunk decode sees the native FP8 QK loss without enough replay gain.
             use_native_fp8_qk = False
+    # FP8 PV MMA requires num_warps_kv==1 (only verify path with cta_tile_q=64).
+    # Decode path uses num_warps_kv=4 which is incompatible.
+    # Decouple from FP8 QK: FP8 PV is safe independently because P values
+    # are in [0,1] and PV errors average out in accumulation.
     use_native_fp8_pv = (
-        use_native_fp8_qk
-        and plan.mode in ("decode", "verify")
+        plan.kv_dtype == torch.float8_e4m3fn
+        and plan.mode == "verify"
         and plan.kv_chunk_size <= 384
+        and plan.cta_tile_q == 64
     )
     return use_native_fp8_qk, use_native_fp8_pv, decode_runtime_chunk_guard
 
