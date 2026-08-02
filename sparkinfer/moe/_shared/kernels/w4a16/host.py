@@ -301,6 +301,27 @@ def plan_w4a16_buffers(
     route_slots = max_packed_route_slots(routed_rows, block_size_m, route_num_experts)
     route_blocks = (route_slots + block_size_m - 1) // block_size_m
     scratch_sms = int(sms)
+    # `run_w4a16_moe`'s small-M "direct top-k routes" / TC-decode fast path
+    # (see kernel.py's ``route_slots_for_scratch``) never calls
+    # ``pack_topk_routes_by_expert`` at all -- it feeds the raw, unpacked
+    # ``m * topk`` routes straight to the fused kernel and reserves one full
+    # ``block_size_m``-sized scratch tile per routed row, i.e. its actual
+    # fc1/fc2 ``c_tmp`` requirement is ``routed_rows * block_size_m``
+    # elements, independent of ``route_num_experts``. ``max_packed_route_
+    # slots`` above instead models the *packed/grouped* kernel path, where
+    # multiple routes can share a block within the same expert -- a tighter
+    # bound that only holds when packing actually happens. The two bounds
+    # can diverge (e.g. tiny ``route_num_experts`` relative to
+    # ``routed_rows``, as in a degenerate single-expert "MoE"), and
+    # whichever kernel path a given call ends up on, the fc1/fc2 scratch
+    # buffers are shared, so the allocator must cover both. Mathematically
+    # ``max_packed_route_slots(...) <= routed_rows * block_size_m`` always
+    # (see its own numel<num_experts branch), so this union is safe and,
+    # for large routed_rows where the packed bound is far smaller, free:
+    # ``packed_gemm_scratch_elements`` caps its result at an SM-count-based
+    # ceiling that the packed bound already saturates well before the
+    # direct-mode bound would matter.
+    scratch_route_slots = max(route_slots, routed_rows * block_size_m)
     return W4A16BufferPlan(
         routed_rows=routed_rows,
         fc1_cols=fc1_cols,
@@ -308,13 +329,13 @@ def plan_w4a16_buffers(
         route_blocks=route_blocks,
         fc1_c_tmp_elements=packed_gemm_scratch_elements(
             size_n=fc1_cols,
-            route_slots=route_slots,
+            route_slots=scratch_route_slots,
             moe_block_size=block_size_m,
             sms=scratch_sms,
         ),
         fc2_c_tmp_elements=packed_gemm_scratch_elements(
             size_n=hidden_size,
-            route_slots=route_slots,
+            route_slots=scratch_route_slots,
             moe_block_size=block_size_m,
             sms=scratch_sms,
         ),
