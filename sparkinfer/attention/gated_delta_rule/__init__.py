@@ -50,6 +50,7 @@ META = OpMeta(
     api_style="oneshot",
     entry_points=(
         "fused_recurrent_gated_delta_rule_multistep",
+        "fused_recurrent_gated_delta_rule_multistep_indexed",
         "is_supported",
     ),
     dtypes=("bf16",),
@@ -75,6 +76,7 @@ META = OpMeta(
 if TYPE_CHECKING:  # static analysis only; runtime resolution is lazy
     from .api import (  # noqa: F401
         fused_recurrent_gated_delta_rule_multistep,
+        fused_recurrent_gated_delta_rule_multistep_indexed,
         is_supported,
     )
 

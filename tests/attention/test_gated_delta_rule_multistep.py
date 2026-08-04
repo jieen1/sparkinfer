@@ -196,6 +196,35 @@ def test_bit_exact_vs_sequential_fla_launches_fp32_gate():
     )
 
 
+def test_indexed_pool_write_is_bit_exact_to_snapshot_states():
+    """Historical spec rows replace gather/snapshots/index_copy exactly."""
+    device = require_sparkinfer()
+    dims = dict(B=2, T=5, H=4, HV=8, K=32, V=48)
+    q, k, v, g, beta, initial_state, _ = _make_case(
+        **dims, seed=20260804, device=device, g_dtype=torch.float32
+    )
+    expected_out, expected_states = gated_delta_rule.fused_recurrent_gated_delta_rule_multistep(
+        q, k, v, g, beta, initial_state
+    )
+    pool = torch.randn(16, dims["HV"], dims["K"], dims["V"], device=device).to(
+        torch.bfloat16
+    )
+    source = torch.tensor([2, 9], device=device, dtype=torch.int64)
+    destination = torch.tensor([[2, 3, 4, 5, 6], [9, 10, 11, 12, 13]], device=device)
+    pool.index_copy_(0, source, initial_state)
+    before = pool.clone()
+
+    actual_out = gated_delta_rule.fused_recurrent_gated_delta_rule_multistep_indexed(
+        q, k, v, g, beta, pool, source, destination
+    )
+
+    assert torch.equal(actual_out, expected_out)
+    for batch_idx in range(dims["B"]):
+        assert torch.equal(pool[destination[batch_idx]], expected_states[batch_idx, 1:])
+    untouched = torch.tensor([0, 1, 7, 8, 14, 15], device=device)
+    assert torch.equal(pool[untouched], before[untouched])
+
+
 def test_bf16_roundtrip_matches_torch_cast_rne():
     """The kernel's per-step state rounding relies on Triton's
     ``.to(tl.bfloat16)`` matching PyTorch's fp32->bf16 cast bit-for-bit

@@ -5,7 +5,10 @@ from __future__ import annotations
 import torch
 
 from ..._lib.gating import has_triton, is_sparkinfer
-from .kernel import fused_recurrent_gdn_multistep_fwd
+from .kernel import (
+    fused_recurrent_gdn_multistep_fwd,
+    fused_recurrent_gdn_multistep_indexed_fwd,
+)
 
 
 def _validate(
@@ -77,7 +80,9 @@ def _validate(
         raise ValueError(
             "gated_delta_rule multistep operands must all be on the same device"
         )
-    for name, tensor in zip(("q", "k", "v", "g", "beta", "initial_state"), tensors):
+    for name, tensor in zip(
+        ("q", "k", "v", "g", "beta", "initial_state"), tensors, strict=True
+    ):
         if tensor.numel() and int(tensor.stride(-1)) != 1:
             raise ValueError(f"{name} innermost dimension must be contiguous")
     return B, T, H, HV, K, V
@@ -112,6 +117,78 @@ def _fake(
     o = torch.empty_like(v)
     hs = q.new_empty((B, T + 1, HV, K, V), dtype=initial_state.dtype)
     return o, hs
+
+
+def _validate_indexed_state_pool(
+    state_pool: torch.Tensor,
+    source_index: torch.Tensor,
+    destination_index: torch.Tensor,
+    *,
+    B: int,
+    T: int,
+    HV: int,
+    K: int,
+    V: int,
+    device: torch.device,
+) -> None:
+    if state_pool.ndim != 4 or tuple(state_pool.shape[1:]) != (HV, K, V):
+        raise ValueError(
+            f"state_pool must have shape [rows,{HV},{K},{V}], got {tuple(state_pool.shape)}"
+        )
+    if (
+        state_pool.dtype != torch.bfloat16
+        or not state_pool.is_cuda
+        or state_pool.device != device
+    ):
+        raise ValueError("state_pool must be CUDA BF16 on the recurrence device")
+    if tuple(source_index.shape) != (B,) or tuple(destination_index.shape) != (B, T):
+        raise ValueError(
+            f"source_index/destination_index must have shapes {(B,)} and {(B, T)}, got "
+            f"{tuple(source_index.shape)} and {tuple(destination_index.shape)}"
+        )
+    for name, index in (
+        ("source_index", source_index),
+        ("destination_index", destination_index),
+    ):
+        if index.dtype not in (torch.int32, torch.int64):
+            raise TypeError(f"{name} must be int32 or int64, got {index.dtype}")
+        if not index.is_cuda or index.device != device or not index.is_contiguous():
+            raise ValueError(f"{name} must be a contiguous CUDA tensor on the recurrence device")
+
+
+@torch.library.custom_op(
+    "sparkinfer::gdn_fused_recurrent_multistep_indexed", mutates_args=("state_pool",)
+)
+def _indexed_op(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    state_pool: torch.Tensor,
+    source_index: torch.Tensor,
+    destination_index: torch.Tensor,
+    scale: float,
+) -> torch.Tensor:
+    return fused_recurrent_gdn_multistep_indexed_fwd(
+        q, k, v, g, beta, state_pool, source_index, destination_index, scale
+    )
+
+
+@_indexed_op.register_fake
+def _indexed_fake(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    state_pool: torch.Tensor,
+    source_index: torch.Tensor,
+    destination_index: torch.Tensor,
+    scale: float,
+) -> torch.Tensor:
+    del q, k, g, beta, state_pool, source_index, destination_index, scale
+    return torch.empty_like(v)
 
 
 def fused_recurrent_gated_delta_rule_multistep(
@@ -189,6 +266,41 @@ def fused_recurrent_gated_delta_rule_multistep(
     return out, states
 
 
+def fused_recurrent_gated_delta_rule_multistep_indexed(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    state_pool: torch.Tensor,
+    source_index: torch.Tensor,
+    destination_index: torch.Tensor,
+    *,
+    scale: float | None = None,
+) -> torch.Tensor:
+    """Advance and persist every candidate state through fixed pool rows.
+
+    ``source_index`` supplies the state selected by the prior round's
+    accepted length.  Each ``destination_index[:, t]`` receives the state
+    after candidate ``t``.  Unlike the snapshot API, this never gathers an
+    incoming state or materializes a ``[B, T + 1, H, K, V]`` temporary.
+    """
+    B, T, H, HV, K, V = _validate(q, k, v, g, beta, state_pool[: q.shape[0]])
+    _validate_indexed_state_pool(
+        state_pool,
+        source_index,
+        destination_index,
+        B=B,
+        T=T,
+        HV=HV,
+        K=K,
+        V=V,
+        device=q.device,
+    )
+    resolved_scale = float(q.shape[-1]) ** -0.5 if scale is None else float(scale)
+    return _indexed_op(q, k, v, g, beta, state_pool, source_index, destination_index, resolved_scale)
+
+
 def is_supported(device=None) -> bool:
     """True on SM120/SM121 with triton (this op is pure Triton -- unlike
     most of sparkinfer, it does not need the CUTLASS DSL)."""
@@ -202,6 +314,7 @@ def clear_caches() -> None:
 
 __all__ = [
     "fused_recurrent_gated_delta_rule_multistep",
+    "fused_recurrent_gated_delta_rule_multistep_indexed",
     "is_supported",
     "clear_caches",
 ]

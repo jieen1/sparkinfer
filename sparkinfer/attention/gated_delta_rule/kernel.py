@@ -162,6 +162,98 @@ def _fused_recurrent_gdn_multistep_kernel(
         p_o += stride_v
 
 
+@triton.jit(do_not_specialize=["T"])
+def _fused_recurrent_gdn_multistep_indexed_kernel(
+    q_ptr,
+    k_ptr,
+    v_ptr,
+    g_ptr,
+    beta_ptr,
+    state_pool_ptr,
+    source_index_ptr,
+    destination_index_ptr,
+    o_ptr,
+    T,
+    scale,
+    H: tl.constexpr,
+    HV: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    BK: tl.constexpr,
+    BV: tl.constexpr,
+):
+    """One multistep recurrence with historical pool-addressed state I/O.
+
+    ``source_index`` selects the last accepted state from the preceding
+    verify round.  Each candidate column's BF16-rounded result is stored
+    directly at ``destination_index[:, t]``.  This is the same persistence
+    contract as vLLM's speculative GDN kernel and removes the runtime's
+    gather -> temporary snapshots -> index_copy sequence.
+    """
+    i_v, i_nh = tl.program_id(0), tl.program_id(1)
+    i_n, i_hv = i_nh // HV, i_nh % HV
+    i_h = i_hv // (HV // H)
+    i_n64 = i_n.to(tl.int64)
+    i_hv64 = i_hv.to(tl.int64)
+    i_h64 = i_h.to(tl.int64)
+    T64 = T.to(tl.int64)
+
+    o_k = tl.arange(0, BK)
+    o_v = i_v * BV + tl.arange(0, BV)
+    mask_k = o_k < K
+    mask_v = o_v < V
+    mask_h = mask_k[:, None] & mask_v[None, :]
+
+    stride_qk = H * K
+    stride_v = HV * V
+    p_q = q_ptr + i_n64 * T64 * stride_qk + i_h64 * K + o_k
+    p_k = k_ptr + i_n64 * T64 * stride_qk + i_h64 * K + o_k
+    p_v = v_ptr + i_n64 * T64 * stride_v + i_hv64 * V + o_v
+    p_g = g_ptr + i_n64 * T64 * HV + i_hv64
+    p_beta = beta_ptr + i_n64 * T64 * HV + i_hv64
+    p_o = o_ptr + i_n64 * T64 * stride_v + i_hv64 * V + o_v
+
+    state_stride = HV * K * V
+    source_row = tl.load(source_index_ptr + i_n64).to(tl.int64)
+    p_h = state_pool_ptr + source_row * state_stride + i_hv64 * (K * V) + o_k[:, None] * V + o_v[None, :]
+    b_h = tl.load(p_h, mask=mask_h, other=0.0).to(tl.float32)
+    p_destination = destination_index_ptr + i_n64 * T64
+
+    for t in tl.range(0, T):
+        b_q = tl.load(p_q, mask=mask_k, other=0.0).to(tl.float32)
+        b_k = tl.load(p_k, mask=mask_k, other=0.0).to(tl.float32)
+        b_v = tl.load(p_v, mask=mask_v, other=0.0).to(tl.float32)
+        b_q = b_q / tl.sqrt(tl.sum(b_q * b_q) + 1e-6)
+        b_k = b_k / tl.sqrt(tl.sum(b_k * b_k) + 1e-6)
+        b_q = b_q * scale
+        b_beta = tl.load(p_beta).to(tl.float32)
+        b_g = tl.load(p_g).to(tl.float32)
+
+        b_h *= tl.exp(b_g)
+        b_v_new = b_beta * (b_v - tl.sum(b_h * b_k[:, None], 0))
+        b_h += b_k[:, None] * b_v_new
+        b_o = tl.sum(b_h * b_q[:, None], 0)
+        tl.store(p_o, b_o.to(p_o.dtype.element_ty), mask=mask_v)
+
+        b_h = b_h.to(tl.bfloat16).to(tl.float32)
+        destination_row = tl.load(p_destination + t.to(tl.int64)).to(tl.int64)
+        p_destination_state = (
+            state_pool_ptr
+            + destination_row * state_stride
+            + i_hv64 * (K * V)
+            + o_k[:, None] * V
+            + o_v[None, :]
+        )
+        tl.store(p_destination_state, b_h.to(p_destination_state.dtype.element_ty), mask=mask_h)
+
+        p_q += stride_qk
+        p_k += stride_qk
+        p_v += stride_v
+        p_g += HV
+        p_beta += HV
+        p_o += stride_v
+
+
 def fused_recurrent_gdn_multistep_fwd(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -206,3 +298,48 @@ def fused_recurrent_gdn_multistep_fwd(
         num_stages=3,
     )
     return o, hs
+
+
+def fused_recurrent_gdn_multistep_indexed_fwd(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    state_pool: torch.Tensor,
+    source_index: torch.Tensor,
+    destination_index: torch.Tensor,
+    scale: float | None = None,
+) -> torch.Tensor:
+    """Run the pool-addressed multistep recurrence without snapshots."""
+    B, T, H, K = q.shape
+    HV, V = v.shape[2], v.shape[3]
+    if scale is None:
+        scale = K ** -0.5
+
+    BK = triton.next_power_of_2(K)
+    BV = min(8, triton.next_power_of_2(V))
+    NV = triton.cdiv(V, BV)
+    o = torch.empty_like(v)
+    _fused_recurrent_gdn_multistep_indexed_kernel[(NV, B * HV)](
+        q,
+        k,
+        v,
+        g,
+        beta,
+        state_pool,
+        source_index,
+        destination_index,
+        o,
+        T,
+        scale,
+        H=H,
+        HV=HV,
+        K=K,
+        V=V,
+        BK=BK,
+        BV=BV,
+        num_warps=1,
+        num_stages=3,
+    )
+    return o
