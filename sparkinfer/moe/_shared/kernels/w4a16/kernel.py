@@ -10060,8 +10060,10 @@ def run_w4a16_moe(
             )
         barrier_count = prepared.workspace[-2:-1]
         barrier_epoch = prepared.workspace[-1:]
-        barrier_count.zero_()
-        barrier_epoch.zero_()
+        # `_make_workspace` initializes the persistent barrier state to zero.
+        # The resident-grid barrier resets its count and advances its epoch
+        # before every return, so re-zeroing both scalars per layer only adds
+        # two captured GPU launches to each decode/verify replay.
         torch.ops.sparkinfer.w4a16_small_m_direct_launch(
             a_input,
             prepared.w13.view(torch.uint8),
