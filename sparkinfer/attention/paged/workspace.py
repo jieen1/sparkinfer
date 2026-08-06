@@ -499,6 +499,7 @@ class PagedAttentionWorkspace:
     _prefill_graph_max_q_tiles_per_req: int | None = None
     _prefill_graph_max_chunks_per_q_tile: int | None = None
     _prefill_graph_max_q_rows_per_req: int | None = None
+    _last_replay_page_key: object | None = None
     _live_plane_tma_desc_cache: dict[
         tuple[int, int, tuple[int, ...], tuple[int, ...], int, int],
         tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor, torch.Tensor],
@@ -986,6 +987,7 @@ class PagedAttentionWorkspace:
         cu_seqlens_q: torch.Tensor,
         *,
         window_left: int = -1,
+        replay_page_key: object | None = None,
     ) -> PagedAttentionWorkspace:
         if not self.use_cuda_graph:
             raise RuntimeError(
@@ -1018,8 +1020,25 @@ class PagedAttentionWorkspace:
             # worklist updater would be redundant and would hide scheduler
             # latency outside the captured attention graph.
             return self
+        if (
+            replay_page_key is not None
+            and self.mode == "verify"
+            and self._last_replay_page_key == replay_page_key
+        ):
+            # The split-KV worklist is a pure function of the per-request
+            # page count (ceil(cache_seqlen / page_size)) plus the
+            # capture-static geometry.  At 128K steady state the page count
+            # only changes every 32 rounds (4 accepted tokens/round/slot),
+            # so re-issuing the three worklist Triton kernels for every
+            # layer every round is pure overhead.  The buffers already hold
+            # the correct values from the last update -- skip until the page
+            # count actually moves.  ``_copy_runtime_metadata`` still runs
+            # above because cache_seqlens/page_table are consumed by the
+            # kernel every replay.
+            return self
         with record_function("paged_workspace.update_prefill_graph_replay_metadata"):
             self._update_prefill_graph_replay_metadata_from_runtime()
+        self._last_replay_page_key = replay_page_key
         return self
 
     def _uses_laguna_verify_analytic_schedule(self) -> bool:
@@ -2108,8 +2127,13 @@ class PagedAttentionWorkspace:
                         # the live chunk size each replay through
                         # update_prefill_graph_chunk_metadata, which is
                         # geometry-generic (CTA_TILE_Q / GQA_GROUP_SIZE /
-                        # PAGE_SIZE are its only shape parameters).
-                        self._plan.cta_tile_q == 16
+                        # PAGE_SIZE are its only shape parameters).  Both the
+                        # legacy M16 plan and the M32 raw-FP8 verifier plan
+                        # (2026-08-06 optimization) keep the same adaptive
+                        # contract; cta_tile_q=32 is now the production
+                        # choice because one tile covers all four verifier
+                        # tokens.
+                        self._plan.cta_tile_q in (16, 32)
                         and self._plan.head_dim_qk == 256
                         and self._plan.head_dim_vo == 256
                     )

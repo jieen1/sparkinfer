@@ -429,6 +429,38 @@ def _build_laguna_verify_forward_kernel(
     )
 
 
+@lru_cache(maxsize=32)
+def _build_raw_fp8_verify_forward_kernel(
+    page_tiles_per_entry: int,
+    cta_tile_q: int,
+    head_dim: int,
+    batch: int,
+    max_chunks_per_request: int,
+    two_wave_b1: bool,
+    use_tma_kv_load: bool,
+) -> PagedFp8ExtendRawForwardKernel:
+    """Build the worklist-driven raw-FP8 verifier for either supported family.
+
+    Laguna's q=8/GQA6 verifier uses the M64/D128 analytic specialization
+    (``analytic_verify_batch`` maps block_z to requests).  Qwen3.6's q=K+1/
+    GQA6 verifier uses the M32/D256 worklist path added 2026-08-06: one
+    query tile covers all K+1 tokens, halving the KV reads the M16 path
+    needed, and the two-CTA/SM residency lets a b4 launch fit in one SM
+    wave at 23 chunks per request.
+    """
+    return PagedFp8ExtendRawForwardKernel(
+        split_kv=True,
+        cta_tile_q=cta_tile_q,
+        page_size=128,
+        head_dim=head_dim,
+        page_tiles_per_entry=page_tiles_per_entry,
+        analytic_verify_batch=batch,
+        analytic_verify_max_chunks=max_chunks_per_request,
+        analytic_verify_two_wave_b1=two_wave_b1,
+        use_tma_kv_load=use_tma_kv_load,
+    )
+
+
 def _use_laguna_verify_forward_kernel(
     *,
     plan,
@@ -461,6 +493,67 @@ def _use_laguna_verify_forward_kernel(
         and not use_native_fp8_qk
         and not has_attention_sink_bias
         and not has_relative_attention_bias
+    )
+
+
+def _use_raw_fp8_verify_forward_kernel(
+    *,
+    plan,
+    traits: PagedForwardTraits,
+    use_native_fp8_qk: bool,
+    has_attention_sink_bias: bool,
+    has_relative_attention_bias: bool,
+) -> bool:
+    """Route both fixed-geometry verifier families to the raw-FP8 kernel.
+
+    The exact Laguna M64/D128 analytic verifier and the Qwen3.6 M32/D256
+    worklist verifier share the raw-FP8 kernel class but use different
+    schedules (analytic block mapping vs generic worklist).  Keeping the
+    analytic flags keyed on the exact Laguna predicate is load-bearing:
+    ``laguna_verify_two_wave_b1`` and the analytic merge must not activate
+    for the worklist path.
+    """
+    batch_capacity = int(plan.page_table_shape[0])
+    common = (
+        plan.mode == "verify"
+        and plan.enable_cuda_graph
+        and plan.split_kv
+        and not plan.msa_block_sparse
+        and plan.window_left < 0
+        and plan.page_size == 128
+        and plan.dtype == torch.bfloat16
+        and plan.kv_dtype == torch.float8_e4m3fn
+        and plan.gqa_group_size == 6
+        and 1 <= batch_capacity <= 8
+        and not use_native_fp8_qk
+        and not has_attention_sink_bias
+        and not has_relative_attention_bias
+    )
+    if not common:
+        return False
+    if (
+        plan.cta_tile_q == 64
+        and plan.head_dim_qk == 128
+        and plan.head_dim_vo == 128
+        and traits.cta_tile_kv == 64
+        and traits.num_warps_q == 4
+        and traits.num_warps_kv == 1
+        and int(plan.total_q) == batch_capacity * 8
+        and int(plan.num_qo_tiles) == batch_capacity
+        and all(int(qo_tile) == 0 for qo_tile in plan.qo_tile_indices)
+    ):
+        return True
+    # Qwen3.6 M32/D256 worklist verifier: every capture-time query length
+    # (K+1 = 2..5 for MTP K=3) packs into a single 32-row tile, so
+    # num_qo_tiles == batch and every tile index is zero.
+    return bool(
+        plan.cta_tile_q == 32
+        and plan.head_dim_qk == 256
+        and plan.head_dim_vo == 256
+        and int(plan.num_qo_tiles) == batch_capacity
+        and all(int(qo_tile) == 0 for qo_tile in plan.qo_tile_indices)
+        and int(plan.total_q) % batch_capacity == 0
+        and 2 <= int(plan.total_q) // batch_capacity <= 5
     )
 
 
@@ -947,12 +1040,18 @@ def paged_attention_forward(
     single_request_decode_graph = False
     single_qtile_decode_graph = False
     regularized_decode_graph = False
-    use_laguna_verify_kernel = _use_laguna_verify_forward_kernel(
+    use_raw_fp8_verify_kernel = _use_raw_fp8_verify_forward_kernel(
         plan=plan,
         traits=traits,
         use_native_fp8_qk=use_native_fp8_qk,
         has_attention_sink_bias=has_attention_sink_bias,
         has_relative_attention_bias=has_relative_attention_bias,
+    )
+    use_laguna_verify_kernel = bool(
+        use_raw_fp8_verify_kernel
+        and plan.cta_tile_q == 64
+        and plan.head_dim_qk == 128
+        and plan.head_dim_vo == 128
     )
     use_laguna_decode_analytic_kernel = _use_laguna_decode_analytic_kernel(
         plan=plan,
@@ -973,7 +1072,7 @@ def paged_attention_forward(
     )
     laguna_verify_max_chunks = (
         int(plan.total_num_partial_rows) // int(plan.total_q)
-        if use_laguna_verify_kernel
+        if use_raw_fp8_verify_kernel
         else 0
     )
     if plan.mode == "extend":
@@ -990,9 +1089,11 @@ def paged_attention_forward(
             bool(getattr(plan, "msa_union_tile", False)),
             page_size,
         )
-    elif use_laguna_verify_kernel:
-        forward_kernel = _build_laguna_verify_forward_kernel(
+    elif use_raw_fp8_verify_kernel:
+        forward_kernel = _build_raw_fp8_verify_forward_kernel(
             page_tiles_per_entry,
+            int(plan.cta_tile_q),
+            int(plan.head_dim_qk),
             int(plan.page_table_shape[0]),
             laguna_verify_max_chunks,
             laguna_verify_two_wave_b1,
@@ -1055,7 +1156,7 @@ def paged_attention_forward(
     forward_lse = workspace.tmp_lse if plan.split_kv else workspace.lse
     assert forward_output is not None
     assert forward_lse is not None
-    if use_laguna_verify_kernel or use_laguna_decode_analytic_kernel:
+    if use_raw_fp8_verify_kernel or use_laguna_decode_analytic_kernel:
         partial_rows = int(plan.total_num_partial_rows)
         forward_output = forward_output[:partial_rows]
         forward_lse = forward_lse[:partial_rows]
@@ -1264,7 +1365,7 @@ def paged_attention_forward(
             bool(has_relative_attention_bias),
             bool(plan.msa_block_sparse),
             bool(getattr(plan, "msa_union_tile", False)),
-            bool(use_laguna_verify_kernel),
+            bool(use_raw_fp8_verify_kernel),
             bool(laguna_verify_two_wave_b1),
             bool(laguna_verify_use_tma),
             int(page_size),
@@ -1414,7 +1515,7 @@ def paged_attention_forward(
             )
         )
         cache_key_labels.extend(("k_tma_desc_ptrs", "v_tma_desc_ptrs"))
-    if use_laguna_verify_kernel:
+    if use_raw_fp8_verify_kernel:
         # Keep the verifier entry's ABI as narrow as its device contract:
         # no window, sparse-index, bias, or extend-only metadata reaches the
         # specialization, so those paths cannot inflate its register footprint.

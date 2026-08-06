@@ -724,6 +724,22 @@ def _paged_determine_cta_tile_q(
         # length still only controls device-side chunk validity.
         del max_effective_kv_pages
         return 64
+    if (
+        mode == "verify"
+        and kv_dtype == _FP8_KV_DTYPE
+        and packed_qo_len <= 32
+        and head_dim == 256
+        and page_size == 128
+    ):
+        # Qwen3.6's uniform q=4/GQA6 verifier has exactly 24 packed rows.
+        # One M32 raw-FP8 verifier tile covers the whole request, so every
+        # paged K/V tile is read once per request instead of twice through
+        # the two M16 query tiles (validated 2026-08-06 in qwen-sm120-runtime
+        # scripts/probe_qwen36_verify_gpu_profile.py: attention was the
+        # largest single verify item at ~0.94 ms/call).  The raw verifier
+        # supports head_dim=256 with cta_tile_q=32 and fits two CTAs per SM.
+        del max_effective_kv_pages
+        return 32
     if mode in ("decode", "verify"):
         # The production paged decode kernel's exact-plane K/V TMA path is a
         # one-Q-warp, M16 kernel.  Larger GQA groups are represented by
@@ -805,6 +821,26 @@ def chunk_pages_for_family(
         # The M64 verifier has only one query tile per request.  Spend the full
         # fixed graph work budget on KV splits; replay will shrink the same
         # grid analytically from the live device cache lengths.
+        chunk_pages = _ceil_div(
+            max(int(max_effective_kv_pages), 1),
+            max(int(max_chunks_per_req), 1),
+        )
+    elif (
+        mode == "verify"
+        and cta_tile_q == 32
+        and kv_dtype == _FP8_KV_DTYPE
+        and page_size == 128
+        and head_dim_qk == 256
+        and head_dim_vo == 256
+        and gqa_group_size == 6
+        and max_chunks_per_req is not None
+    ):
+        # The Qwen3.6 M32 verifier also has one query tile per request.
+        # Spend the full fixed graph work budget on KV splits; replay keeps
+        # the same chunk count at any live length through the generic
+        # adaptive prefill chunk updater (workspace.py white-lists this
+        # geometry), so the 256K-capacity capture yields ~23 chunks per
+        # request at 128K instead of the M16 plan's 11.
         chunk_pages = _ceil_div(
             max(int(max_effective_kv_pages), 1),
             max(int(max_chunks_per_req), 1),
