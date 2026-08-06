@@ -2086,13 +2086,34 @@ class PagedAttentionWorkspace:
             adaptive_chunking=bool(
                 self.mode == "verify"
                 and self._plan.split_kv
-                and self._plan.cta_tile_q == 64
                 and self._plan.window_left < 0
                 and self._plan.page_size == 128
-                and self._plan.head_dim_qk == 128
-                and self._plan.head_dim_vo == 128
                 and self._plan.gqa_group_size == 6
                 and self._plan.kv_dtype == torch.float8_e4m3fn
+                and (
+                    # Laguna verifier geometry (validated 2026-07).
+                    (
+                        self._plan.cta_tile_q == 64
+                        and self._plan.head_dim_qk == 128
+                        and self._plan.head_dim_vo == 128
+                    )
+                    or (
+                        # Qwen3.6 verifier geometry (validated 2026-08-06):
+                        # the capture-static plan is sized for the worst-case
+                        # 262144-token slot, whose chunking leaves half the
+                        # work items idle at 128K live length (measured
+                        # 1.074 vs 0.809 ms/call at b4 in
+                        # qwen-sm120-runtime scripts/probe_qwen36_graph_
+                        # attn_capacity.py).  Adaptive re-chunking rebuilds
+                        # the live chunk size each replay through
+                        # update_prefill_graph_chunk_metadata, which is
+                        # geometry-generic (CTA_TILE_Q / GQA_GROUP_SIZE /
+                        # PAGE_SIZE are its only shape parameters).
+                        self._plan.cta_tile_q == 16
+                        and self._plan.head_dim_qk == 256
+                        and self._plan.head_dim_vo == 256
+                    )
+                )
             ),
         )
 
