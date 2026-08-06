@@ -524,7 +524,6 @@ def _use_raw_fp8_verify_forward_kernel(
         and plan.dtype == torch.bfloat16
         and plan.kv_dtype == torch.float8_e4m3fn
         and plan.gqa_group_size == 6
-        and 1 <= batch_capacity <= 8
         and not use_native_fp8_qk
         and not has_attention_sink_bias
         and not has_relative_attention_bias
@@ -538,6 +537,7 @@ def _use_raw_fp8_verify_forward_kernel(
         and traits.cta_tile_kv == 64
         and traits.num_warps_q == 4
         and traits.num_warps_kv == 1
+        and 1 <= batch_capacity <= 8
         and int(plan.total_q) == batch_capacity * 8
         and int(plan.num_qo_tiles) == batch_capacity
         and all(int(qo_tile) == 0 for qo_tile in plan.qo_tile_indices)
