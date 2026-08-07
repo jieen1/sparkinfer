@@ -738,6 +738,14 @@ def _paged_determine_cta_tile_q(
         # scripts/probe_qwen36_verify_gpu_profile.py: attention was the
         # largest single verify item at ~0.94 ms/call).  The raw verifier
         # supports head_dim=256 with cta_tile_q=32 and fits two CTAs per SM.
+        # SPARKINFER_QWEN36_VERIFY_M16=1 forces the pre-2026-08-06 M16
+        # geometry (generic kernel, two query tiles): the A/B knob for the
+        # M32 split-KV reduction-order attribution (code-4096 dipped 3.1pp
+        # when M32 landed; MTP-off restores the baseline, see qwen-sm120-
+        # runtime notes/2026-08-06-128k-c4-parity-profiling.md section 17).
+        if os.environ.get("SPARKINFER_QWEN36_VERIFY_M16") == "1":
+            del max_effective_kv_pages
+            return 16
         del max_effective_kv_pages
         return 32
     if mode in ("decode", "verify"):

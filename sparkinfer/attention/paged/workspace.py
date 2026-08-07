@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+
 from dataclasses import dataclass, field
 from typing import Literal
 
@@ -2133,7 +2135,15 @@ class PagedAttentionWorkspace:
                         # contract; cta_tile_q=32 is now the production
                         # choice because one tile covers all four verifier
                         # tokens.
-                        self._plan.cta_tile_q in (16, 32)
+                        # SPARKINFER_QWEN36_VERIFY_NO_ADAPTIVE=1 restores the
+                        # pre-2026-08-06 frozen worst-case chunking: the
+                        # bitwise-numerics A/B knob paired with the planner's
+                        # SPARKINFER_QWEN36_VERIFY_M16 (code-4096 attribution:
+                        # adaptive chunking ~-1.9pp, M32 tiling ~-1.2pp vs
+                        # the 08-05 MTP-on baseline; see qwen-sm120-runtime
+                        # notes/2026-08-06-128k-c4-parity-profiling.md S18).
+                        os.environ.get("SPARKINFER_QWEN36_VERIFY_NO_ADAPTIVE") != "1"
+                        and self._plan.cta_tile_q in (16, 32)
                         and self._plan.head_dim_qk == 256
                         and self._plan.head_dim_vo == 256
                     )
