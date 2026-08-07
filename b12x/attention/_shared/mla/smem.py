@@ -218,12 +218,22 @@ def make_smem_layout(traits: UnifiedMLATraits) -> SmemLayout:
     off = q_rope_off + q_rope_bytes  # FlashInfer packs Q regions back-to-back
 
     # --- Q-NoPE staging. FP8 normally; BF16 for native NVFP4 cache math. ---
+    # DSV4 bf16-Q mode: the QK A-operand is read per-lane straight from
+    # global (no smem staging at all), so this region is empty there -- the
+    # smem budget on SM120 cannot hold a bf16 Q staging on top of the
+    # existing 93-101 KiB layout.
     q_fp8_off = off
-    q_element_bytes = 2 if traits.scale_format == ScaleFormat.NVFP4_E4M3 else 1
-    q_fp8_bytes = hpb * q_nope_stride * q_element_bytes
+    q_element_bytes = (
+        2
+        if traits.scale_format == ScaleFormat.NVFP4_E4M3
+        else 1
+    )
+    q_fp8_bytes = 0 if traits.dsv4_bf16_q else hpb * q_nope_stride * q_element_bytes
     off = q_fp8_off + q_fp8_bytes
 
     # --- Q per-head scales: FP32 power-of-2 (converted to UE8M0 sfa at use). ---
+    # Dead in the DSV4 bf16-Q mode but kept at full size: the kernel builds
+    # its q_sc view unconditionally and CUTLASS rejects zero-size layouts.
     q_sc_off = off
     q_sc_stride = num_scales
     q_sc_bytes = hpb * num_scales * 4

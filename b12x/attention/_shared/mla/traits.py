@@ -81,6 +81,13 @@ class UnifiedMLATraits:
     # [292, 296) of the 368-byte fp8-rope record). False keeps every existing
     # specialization (and its smem layout / PTX) byte-identical.
     latent_scale_per_token: bool = False
+    # DSV4-only numerics mode (2026-08-07): stage Q-NoPE as BF16 (no FP8
+    # quantization, no Q scale buffer) and run the QK-NoPE in the BF16 MMA,
+    # matching the official reference's BF16 Q contract. The K operand stays
+    # the raw e4m3 cache bytes, dequantized in registers (bit-exact with the
+    # eager round-trip). False keeps every existing specialization (and its
+    # smem layout / PTX) byte-identical.
+    dsv4_bf16_q: bool = False
 
 
 def make_unified_traits(

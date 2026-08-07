@@ -39,6 +39,7 @@ from .decode_math import (
     s0_quantize_q_to_smem,
     s1_qk_nope_block_scaled,
     s1_qk_nope_block_scaled_dsv4_h8_swap_ab,
+    s1_qk_nope_dsv4_bf16,
     s1_qk_nope_block_scaled_glm_h8_swap_ab,
     s2_qk_rope_bf16,
     s2_qk_rope_bf16_glm_h8_swap_ab,
@@ -56,6 +57,17 @@ from .decode_math import (
 )
 from .io import io_issue_gather
 from .smem import get_unified_shared_storage_cls, make_smem_layout
+
+_DSV4_BF16_Q_ENV = "SPARKINFER_MLA_DSV4_BF16_Q"
+
+
+def _env_dsv4_bf16_q_enabled() -> bool:
+    return os.environ.get(_DSV4_BF16_Q_ENV, "0").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
 from .traits import (
     ModelType,
     ScaleFormat,
@@ -393,6 +405,7 @@ class UnifiedDecodeKernel:
         native_glm_h8=False,
         native_dsv4_h8=False,
         native_dsv4_h16=False,
+        dsv4_bf16_q=False,
     ):
         self.traits = traits
         self.layout = layout
@@ -433,6 +446,7 @@ class UnifiedDecodeKernel:
         # Native H16: two independent 8-head H8 groups (4 math warps each)
         # sharing the CTA's packed KV stage. Grid keeps HPB=16 head blocks.
         self.native_dsv4_h16 = bool(native_dsv4_h16)
+        self.dsv4_bf16_q = bool(dsv4_bf16_q)
         self.native_h8 = self.native_glm_h8 or self.native_dsv4_h8
         if self.native_dsv4_h8 or self.native_dsv4_h16:
             packed_span = int(layout.kv_bufs) * int(
@@ -826,7 +840,9 @@ class UnifiedDecodeKernel:
         else:
             # MATH WARPS (CONSUMER, warps 0-7 = 256 threads).
             n_acc_tiles = int(t.n_v_chunks) * int(t.nt_per_warp_xv)
-            if cutlass.const_expr(t.scale_format == ScaleFormat.NVFP4_E4M3):
+            if cutlass.const_expr(
+                t.scale_format == ScaleFormat.NVFP4_E4M3 or t.dsv4_bf16_q
+            ):
                 s0_load_q_bf16_to_smem(
                     q_token,
                     q_fp8_addr,
@@ -841,6 +857,7 @@ class UnifiedDecodeKernel:
                     q_rope_stride=L.q_rope_stride,
                     num_threads=self.math_threads,
                     barrier_id=2,
+                    stage_nope=(not t.dsv4_bf16_q),
                 )
             else:
                 s0_quantize_q_to_smem(
@@ -940,6 +957,22 @@ class UnifiedDecodeKernel:
                         )
                         h8_rope_addr = kv_fp8_b + Int32(t.kv_smem_stride)
                         h8_rope_stride = staged_kv_stride
+                    elif cutlass.const_expr(t.dsv4_bf16_q):
+                        print("DBG H8 bf16-q branch", flush=True)
+                        qk = s1_qk_nope_dsv4_bf16(
+                            qk,
+                            q_token,
+                            kv_fp8_b,
+                            kv_sc_b,
+                            head_base,
+                            warp_first_cand,
+                            lane,
+                            num_scales=t.num_scales,
+                            quant_tile=t.quant_tile,
+                            d_nope=t.d_nope,
+                            kv_smem_stride=staged_kv_stride,
+                            scale_bytes_per_token=8,
+                        )
                     else:
                         qk = s1_qk_nope_block_scaled_dsv4_h8_swap_ab(
                             qk,
@@ -1069,6 +1102,9 @@ class UnifiedDecodeKernel:
                         scale_bytes_per_token=8,
                         scale_format=t.scale_format,
                         latent_scale_per_token=t.latent_scale_per_token,
+                        dsv4_bf16_q=t.dsv4_bf16_q,
+                        q_token=q_token,
+                        head_base=head_base,
                     )
                     qk = s2_qk_rope_bf16(
                         qk,
@@ -1898,6 +1934,23 @@ class UnifiedDecodeKernel:
                         )
                         h8_rope_addr = kv_fp8_b + Int32(t.kv_smem_stride)
                         h8_rope_stride = staged_kv_stride
+                    elif cutlass.const_expr(t.dsv4_bf16_q):
+                        qk = s1_qk_nope_dsv4_bf16(
+                            qk,
+                            q_token,
+                            kv_fp8_b,
+                            kv_sc_b,
+                            head_base,
+                            warp_first_cand,
+                            lane,
+                            num_scales=t.num_scales,
+                            quant_tile=t.quant_tile,
+                            d_nope=t.d_nope,
+                            kv_smem_stride=staged_kv_stride,
+                            scale_bytes_per_token=8,
+                        )
+                        h8_rope_addr = kv_rope_b
+                        h8_rope_stride = staged_kv_stride
                     else:
                         qk = s1_qk_nope_block_scaled_dsv4_h8_swap_ab(
                             qk,
@@ -2040,6 +2093,9 @@ class UnifiedDecodeKernel:
                         scale_bytes_per_token=8,
                         scale_format=t.scale_format,
                         latent_scale_per_token=t.latent_scale_per_token,
+                        dsv4_bf16_q=t.dsv4_bf16_q,
+                        q_token=q_token,
+                        head_base=head_base,
                     )
                     qk = s2_qk_rope_bf16(
                         qk,
@@ -2430,6 +2486,10 @@ def _sparse_mla_decode_grid_flat_launch(
             traits,
             nt_per_warp_xv=int(traits.nt_per_warp_xv) * 2,
         )
+    if traits.model_type == ModelType.DSV4 and _env_dsv4_bf16_q_enabled():
+        # DSV4 bf16-Q numerics mode: no FP8 Q quantization, BF16 QK MMA.
+        traits = replace(traits, dsv4_bf16_q=True)
+        print("DBG bf16-q traits active", flush=True)
     layout = make_smem_layout(traits)
     hpb = int(traits.hpb)
     d_v = int(traits.d_v)
@@ -2508,6 +2568,7 @@ def _sparse_mla_decode_grid_flat_launch(
         native_glm_h8=native_glm_h8,
         native_dsv4_h8=native_dsv4_h8,
         native_dsv4_h16=native_dsv4_h16,
+        dsv4_bf16_q=bool(traits.dsv4_bf16_q),
     )
     spec_fields = [
         key_field("model_type", traits.model_type),
@@ -2515,6 +2576,7 @@ def _sparse_mla_decode_grid_flat_launch(
         key_field("scale_format", traits.scale_format),
         key_field("fp8_rope", int(traits.fp8_rope)),
         key_field("latent_scale_per_token", int(traits.latent_scale_per_token)),
+        key_field("dsv4_bf16_q", int(traits.dsv4_bf16_q)),
         key_field("num_heads", heads),
         key_field("hpb", hpb),
         key_field("valid_hpb", int(valid_hpb)),

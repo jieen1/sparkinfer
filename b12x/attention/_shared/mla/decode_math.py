@@ -488,7 +488,7 @@ def s0_quantize_q_to_smem(
 def s0_load_q_bf16_to_smem(
     q_token: cute.Tensor,  # (NUM_HEADS, D_QK) bf16 view for this token
     q_nope_bf16_base_addr: Int32,  # u32 smem addr of BF16 Q-NoPE
-    q_rope_base_addr: Int32,  # u32 smem addr of q_rope (HPB x q_rope_stride bf16)
+    q_rope_base_addr: Int32,  # u32 smem addr of q_rope (hpb x q_rope_stride bf16)
     head_base: Int32,  # first head index of this CTA (h_start)
     valid_hpb: Int32,  # number of valid heads (<= HPB)
     tid: Int32,  # flat thread id in [0, MATH_THREADS)
@@ -501,30 +501,36 @@ def s0_load_q_bf16_to_smem(
     num_threads: cutlass.Constexpr,  # 256
     barrier_id: cutlass.Constexpr,
     barrier_threads: cutlass.Constexpr = 0,  # barrier width override (0 -> num_threads)
+    stage_nope: cutlass.Constexpr = True,  # False: DSV4 bf16-Q mode (Q read from global)
 ):
     """S0 (NVFP4): stage Q-NoPE and Q-RoPE as BF16.
 
     This is the decode-local counterpart to the MG prefill BF16-QK path: no Q
     FP8 quantization and no Q scale side buffer. Invalid tail heads are zeroed so
     the regular VALID_HPB-gated epilogue can reuse the same tile geometry.
+
+    ``stage_nope=False`` (DSV4 bf16-Q numerics mode): only the RoPE half is
+    staged -- the NoPE QK A-operand is read per-lane from global, so there is
+    no NoPE smem region at all (the SM120 smem budget cannot hold one).
     """
     bar_kw = dict(
         barrier_id=barrier_id,
         number_of_threads=(barrier_threads if barrier_threads else num_threads),
     )
 
-    i = tid
-    while i < Int32(hpb * d_nope):
-        h = i // Int32(d_nope)
-        d = i - h * Int32(d_nope)
-        val = Float32(0.0)
-        if h < valid_hpb:
-            val = Float32(q_token[head_base + h, d])
-        st_shared_bf16_from_f32(
-            q_nope_bf16_base_addr + (h * Int32(q_nope_bf16_stride) + d) * Int32(2),
-            val,
-        )
-        i += Int32(num_threads)
+    if cutlass.const_expr(stage_nope):
+        i = tid
+        while i < Int32(hpb * d_nope):
+            h = i // Int32(d_nope)
+            d = i - h * Int32(d_nope)
+            val = Float32(0.0)
+            if h < valid_hpb:
+                val = Float32(q_token[head_base + h, d])
+            st_shared_bf16_from_f32(
+                q_nope_bf16_base_addr + (h * Int32(q_nope_bf16_stride) + d) * Int32(2),
+                val,
+            )
+            i += Int32(num_threads)
 
     i = tid
     while i < Int32(hpb * d_rope):
@@ -565,6 +571,8 @@ def s1_qk_nope_block_scaled(
     warp_first_cand: Int32,  # first candidate of this warp (warp_id * 8)
     lane: Int32,
     latent_scale: Float32,
+    q_token: cute.Tensor | None = None,  # global Q view (DSV4 bf16-Q mode only)
+    head_base: Int32 = Int32(0),
     *,
     num_scales: cutlass.Constexpr,  # 7
     quant_tile: cutlass.Constexpr,  # 64
@@ -574,6 +582,8 @@ def s1_qk_nope_block_scaled(
     scale_format: cutlass.Constexpr = 0,  # ScaleFormat.UE8M0_BYTE (0) / ARBITRARY_FP32 (1)
     valid_hpb: cutlass.Constexpr = 16,
     latent_scale_per_token: cutlass.Constexpr = False,  # NVFP4_E4M3 only
+    dsv4_bf16_q: cutlass.Constexpr = False,  # DSV4 numerics mode (2026-08-07)
+    d_nope: cutlass.Constexpr = 448,  # DSV4 bf16-Q global reads
 ):
     """S1: accumulate Q_nope . K_nope into qk[0..3] via NUM_SCALES*(QUANT_TILE/32)
     block-scaled MMAs (14 DSV4 / 16 GLM).
@@ -608,6 +618,27 @@ def s1_qk_nope_block_scaled(
     A (Q) loaded via ldmatrix.x4 (FP8 A 16x32 for scale_format 0/1, BF16 A
     16x16 for scale_format 2); B follows the matching FP8 or BF16 path.
     """
+    print("DBG dispatcher traced", flush=True)
+    if cutlass.const_expr(dsv4_bf16_q):
+        print("DBG bf16-q branch taken", flush=True)
+        # DSV4 bf16-Q mode: Q is read per-lane from global (no FP8
+        # quantization, no smem staging), K stays the raw e4m3 cache bytes
+        # dequantized in registers; the BF16 MMA matches the official
+        # reference's BF16 Q contract (bit-exact K).
+        return s1_qk_nope_dsv4_bf16(
+            qk,
+            q_token,
+            kv_fp8_base_addr,
+            kv_sc_base_addr,
+            head_base,
+            warp_first_cand,
+            lane,
+            num_scales=num_scales,
+            quant_tile=quant_tile,
+            d_nope=d_nope,
+            kv_smem_stride=kv_smem_stride,
+            scale_bytes_per_token=scale_bytes_per_token,
+        )
     if cutlass.const_expr(scale_format == 2):
         return s1_qk_nope_nvfp4_bf16(
             qk,
@@ -787,6 +818,120 @@ def s1_qk_nope_nvfp4_bf16(
             a_byte = a_row * Int32(q_nope_bf16_stride * 2) + (ko + a_col) * Int32(2)
             a0, a1, a2, a3 = ldmatrix_m8n8x4_b16(
                 _smem_byte(q_nope_bf16_base_addr, a_byte)
+            )
+            qk[0], qk[1], qk[2], qk[3] = mma_m16n8k16_f32_bf16(
+                qk[0],
+                qk[1],
+                qk[2],
+                qk[3],
+                a0,
+                a1,
+                a2,
+                a3,
+                b0,
+                b1,
+            )
+    return qk
+
+
+@cute.jit
+def _dsv4_e4m3_pair_bfloat2(
+    kv_fp8_base_addr: Int32,
+    entry: Int32,
+    dim_even: Int32,
+    scale_f: Float32,
+    *,
+    kv_smem_stride: cutlass.Constexpr,
+) -> Uint32:
+    """Dequant one e4m3 pair * pow2 ue8m0 scale to bf16x2.
+
+    e4m3 -> f16 (exact: 3-bit mantissa fits f16's 10) -> f32 (exact) ->
+    * scale (pow2, exact) -> bf16 (single RTNE rounding) == the eager
+    round-trip's stored bf16 value, bit for bit.
+    """
+    packed = _ld_u16_zext(
+        kv_fp8_base_addr,
+        entry * Int32(kv_smem_stride) + dim_even,
+    )
+    vals_h2 = _cvt_e4m3x2_to_f16x2(packed)
+    v0, v1 = f16x2_to_f32x2(vals_h2)
+    return pack_f32x2_to_bfloat2(v0 * scale_f, v1 * scale_f)
+
+
+@cute.jit
+def s1_qk_nope_dsv4_bf16(
+    qk,
+    q_token: cute.Tensor,  # (NUM_HEADS, D_QK) bf16 view for this token
+    kv_fp8_base_addr: Int32,
+    kv_sc_base_addr: Int32,
+    head_base: Int32,
+    warp_first_cand: Int32,
+    lane: Int32,
+    *,
+    num_scales: cutlass.Constexpr,
+    quant_tile: cutlass.Constexpr,
+    d_nope: cutlass.Constexpr,
+    kv_smem_stride: cutlass.Constexpr,
+    scale_bytes_per_token: cutlass.Constexpr,
+):
+    """S1 (DSV4 bf16-Q): BF16 QK-NoPE, A = Q (global), B = K (dequant).
+
+    The s3 mask pairs (qk[0], qk[2]) = the same candidate column c0 =
+    tid*2 -- the C/D fragment of the m16n8k16.row.col MMA has the heads on
+    the rows (g/g+8) and the candidates on the columns (2t/2t+1), so A
+    (16x16) = Q (16 heads x 16 k), B (16x8) = K (16 k x 8 candidates).
+    PTX fragments (g = lane>>2, t = lane%4): A: a0/a1/a2/a3 = (row g/g+8,
+    col 2t/2t+8) bf16 pairs; B: b0/b1 = (k-row 2t/2t+8, n-col g) pairs.
+    A's Q is read per-lane from global. B's K is the raw e4m3 cache bytes
+    dequantized in registers with the per-(candidate, 64-tile) ue8m0 pow2
+    footer scale -- bit-exact with the eager round-trip.
+    """
+    gid = lane >> Int32(2)
+    tid = lane & Int32(3)
+    cand = warp_first_cand + gid
+    k0 = tid * Int32(2)
+
+    for blk in cutlass.range_constexpr(num_scales):
+        sfa = _ld_u8_zext(
+            kv_sc_base_addr,
+            cand * Int32(scale_bytes_per_token) + Int32(blk),
+        )
+        scale_f = _ue8m0_zext_byte_to_fp32(sfa)
+        for ks in cutlass.range_constexpr(quant_tile // 16):
+            ko = Int32(blk) * Int32(quant_tile) + Int32(ks) * Int32(16)
+            a0, _ = ld_global_nc_v2_u32(
+                get_ptr_as_int64(
+                    q_token,
+                    cute.crd2idx((head_base + gid, ko + k0), q_token.layout),
+                )
+            )
+            a1, _ = ld_global_nc_v2_u32(
+                get_ptr_as_int64(
+                    q_token,
+                    cute.crd2idx((head_base + gid + Int32(8), ko + k0), q_token.layout),
+                )
+            )
+            a2, _ = ld_global_nc_v2_u32(
+                get_ptr_as_int64(
+                    q_token,
+                    cute.crd2idx((head_base + gid, ko + k0 + Int32(8)), q_token.layout),
+                )
+            )
+            a3, _ = ld_global_nc_v2_u32(
+                get_ptr_as_int64(
+                    q_token,
+                    cute.crd2idx(
+                        (head_base + gid + Int32(8), ko + k0 + Int32(8)), q_token.layout
+                    ),
+                )
+            )
+            b0 = _dsv4_e4m3_pair_bfloat2(
+                kv_fp8_base_addr, cand, ko + k0, scale_f,
+                kv_smem_stride=kv_smem_stride,
+            )
+            b1 = _dsv4_e4m3_pair_bfloat2(
+                kv_fp8_base_addr, cand, ko + k0 + Int32(8), scale_f,
+                kv_smem_stride=kv_smem_stride,
             )
             qk[0], qk[1], qk[2], qk[3] = mma_m16n8k16_f32_bf16(
                 qk[0],
