@@ -51,6 +51,7 @@ _OPS: tuple[str, ...] = (
     "gemm.bmm",
     "gemm.mxfp8_linear",
     "gemm.tensor_fp8_linear",
+    "gemm.tensor_fp8_channel_linear",
     "gemm.mla_query_projection",
     "gemm.trellis_linear",
     "gemm.wo_projection",

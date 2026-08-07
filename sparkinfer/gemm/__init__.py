@@ -6,6 +6,7 @@
 - ``block_fp8_linear``: DeepSeek-style serialized block-FP8 linear via MXFP8.
 - ``mxfp8_linear``: ModelOpt MXFP8 linear (one-shot).
 - ``tensor_fp8_linear``: static per-tensor FP8 linear via the SM12x dense GEMM.
+- ``tensor_fp8_channel_linear``: static per-channel FP8 decode linear via the SM12x dense GEMM.
 - ``mla_query_projection``: fused MXFP8 MLA query projection and assembly.
 - ``trellis_linear``: native EXL3 Trellis W4A16 dense linear.
 - ``wo_projection``: fused MLA WO-A/WO-B projections (+ inverse-RoPE variant).
@@ -21,6 +22,7 @@ _OP_MODULES = (
     "block_fp8_linear",
     "mxfp8_linear",
     "tensor_fp8_linear",
+    "tensor_fp8_channel_linear",
     "mla_query_projection",
     "trellis_linear",
     "wo_projection",

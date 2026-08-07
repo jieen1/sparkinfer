@@ -629,6 +629,7 @@ class DenseGemmKernel:
         mxfp6_fmt_b: Optional[str] = None,
         b_packed: bool = False,
         plain_fp8: bool = False,
+        plain_fp8_alpha_col: bool = False,
     ):
         # When set, A/B operands are MX codes carried in Float8E4M3FN
         # byte-containers: the whole kernel runs the MXFP8 smem/TMA/ldmatrix
@@ -644,11 +645,14 @@ class DenseGemmKernel:
         self.mxfp6_fmt_a = mxfp6_fmt_a
         self.mxfp6_fmt_b = mxfp6_fmt_b
         self.plain_fp8 = bool(plain_fp8)
+        self.plain_fp8_alpha_col = bool(plain_fp8_alpha_col)
         if self.plain_fp8:
             assert mxfp6_fmt_a is None
             assert not b_packed
             assert not fused_quant_a
             assert not quantize_c
+        if self.plain_fp8_alpha_col:
+            assert self.plain_fp8
         if mxfp6_fmt_a is not None:
             # Upstream mainloop variants not wired for the FP6 byte-container
             # path; fail loudly instead of silently miscomputing.
@@ -2882,13 +2886,23 @@ class DenseGemmKernel:
                                         if n_local < Int32(
                                             self.epi_tile[1]
                                         ) and n_coord < Int32(directC_mnl.shape[1]):
+                                            value = sC[(Int32(0), n_local, epi_buffer)]
+                                            if cutlass.const_expr(
+                                                self.plain_fp8_alpha_col
+                                            ):
+                                                value = (
+                                                    value.to(cutlass.Float32)
+                                                    * quantA_positions[n_coord].to(
+                                                        cutlass.Float32
+                                                    )
+                                                ).to(self.c_dtype)
                                             directC_mnl[
                                                 (
                                                     Int32(0),
                                                     n_coord,
                                                     tile_coord_mnl[2],
                                                 )
-                                            ] = sC[(Int32(0), n_local, epi_buffer)]
+                                            ] = value
                                 elif cutlass.const_expr(not self.quantize_c):
                                     if warp_idx == 0:
                                         cute.copy(
@@ -4233,6 +4247,7 @@ class _DenseGemmLaunch:
         direct_m1_wo_a_inputs: bool = False,
         target_occupancy: int = 1,
         plain_fp8: bool = False,
+        plain_fp8_alpha_col: bool = False,
     ):
         self._n = n
         self._k = k
@@ -4267,6 +4282,9 @@ class _DenseGemmLaunch:
         self._direct_m1_wo_a_inputs = direct_m1_wo_a_inputs
         self._target_occupancy = target_occupancy
         self._plain_fp8 = bool(plain_fp8)
+        self._plain_fp8_alpha_col = bool(plain_fp8_alpha_col)
+        if self._plain_fp8_alpha_col and not self._plain_fp8:
+            raise ValueError("plain_fp8_alpha_col requires plain_fp8=True")
         if b_tile_major:
             if (n, k, l) == (1024, 4096, 4):
                 self._b_tile_n = 64
@@ -4353,6 +4371,7 @@ class _DenseGemmLaunch:
             self._direct_m1_wo_a_inputs,
             self._target_occupancy,
             self._plain_fp8,
+            self._plain_fp8_alpha_col,
         )
 
     @cute.jit
@@ -4432,6 +4451,10 @@ class _DenseGemmLaunch:
             alpha_ptr,
             layout=cute.make_ordered_layout((1,), order=(0,)),
         )
+        alpha_col_tensor = cute.make_tensor(
+            quant_c_values_ptr,
+            layout=cute.make_ordered_layout((self._n,), order=(0,)),
+        )
         sfa_tensor = cute.make_tensor(sfa_ptr, layout=cute.make_layout((1,)))
         sfb_tensor = cute.make_tensor(sfb_ptr, layout=cute.make_layout((1,)))
         policy = self._policy
@@ -4450,7 +4473,10 @@ class _DenseGemmLaunch:
             # standalone tiny-M profile. Keep C on the direct epilogue path;
             # the normal TMA store did not beat it in the DSV4F TP=2 GPU5 run.
             use_m1_non_tma_a=False,
-            use_m1_non_tma_c=policy.use_m1_non_tma and not self._swap_ab,
+            use_m1_non_tma_c=(
+                (policy.use_m1_non_tma and not self._swap_ab)
+                or self._plain_fp8_alpha_col
+            ),
             use_m1_non_tma_sfa=False,
             load_path=self._load_path,
             swap_ab=self._swap_ab,
@@ -4463,10 +4489,11 @@ class _DenseGemmLaunch:
             direct_m1_wo_a_inputs=self._direct_m1_wo_a_inputs,
             target_occupancy=self._target_occupancy,
             plain_fp8=self._plain_fp8,
+            plain_fp8_alpha_col=self._plain_fp8_alpha_col,
         )(
             a_tensor,
             a_tensor,
-            alpha_tensor,
+            alpha_col_tensor if self._plain_fp8_alpha_col else alpha_tensor,
             alpha_tensor,
             b_tensor,
             sfa_tensor,
@@ -5616,10 +5643,12 @@ def _get_compiled_dense_gemm(
     direct_sfa_live16: bool = False,
     direct_m1_wo_a_inputs: bool = False,
     plain_fp8: bool = False,
+    plain_fp8_alpha_col: bool = False,
 ) -> Callable:
     def _make_runtime_pointers(
         input_tensors: Optional[List[torch.Tensor]],
         quant_c_tensors: Optional[List[torch.Tensor]] = None,
+        alpha_col_tensor: Optional[torch.Tensor] = None,
     ) -> List[cute.Pointer]:
         if input_tensors is None:
             (
@@ -5654,7 +5683,13 @@ def _get_compiled_dense_gemm(
                 c_tensor_gpu.data_ptr(),
                 alpha_tensor_gpu.data_ptr(),
             )
-        if quant_c_tensors is None:
+        if plain_fp8_alpha_col:
+            quant_c_values_ptr = (
+                16 if alpha_col_tensor is None else alpha_col_tensor.data_ptr()
+            )
+            quant_c_scale_rows_ptr = 16
+            quant_c_scale_mma_ptr = 16
+        elif quant_c_tensors is None:
             quant_c_values_ptr = 16
             quant_c_scale_rows_ptr = 16
             quant_c_scale_mma_ptr = 16
@@ -5675,7 +5710,7 @@ def _get_compiled_dense_gemm(
             make_ptr(sf_dtype, sfb_data_ptr, cute.AddressSpace.gmem, assumed_align=16),
             make_ptr(c_dtype, c_data_ptr, cute.AddressSpace.gmem, assumed_align=16),
             make_ptr(
-                cutlass.Float8E4M3FN,
+                cutlass.Float32 if plain_fp8_alpha_col else cutlass.Float8E4M3FN,
                 quant_c_values_ptr,
                 cute.AddressSpace.gmem,
                 assumed_align=16,
@@ -5726,6 +5761,7 @@ def _get_compiled_dense_gemm(
         direct_sfa_live16=direct_sfa_live16,
         direct_m1_wo_a_inputs=direct_m1_wo_a_inputs,
         plain_fp8=plain_fp8,
+        plain_fp8_alpha_col=plain_fp8_alpha_col,
         target_occupancy=_dense_gemm_target_occupancy(
             n=n,
             k=k,
@@ -5766,6 +5802,7 @@ def _get_compiled_dense_gemm(
         quant_c_values_gpu: Optional[torch.Tensor] = None,
         quant_c_scale_rows_gpu: Optional[torch.Tensor] = None,
         quant_c_scale_mma_gpu: Optional[torch.Tensor] = None,
+        alpha_col_tensor_gpu: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         m = a_tensor_gpu.shape[0]
         if c_tensor_gpu is None:
@@ -5777,7 +5814,10 @@ def _get_compiled_dense_gemm(
         if alpha_tensor_gpu is None:
             alpha_tensor_gpu = _cached_alpha_one(a_tensor_gpu.device)
         quant_c_tensors = None
-        if quantize_c:
+        if plain_fp8_alpha_col:
+            if alpha_col_tensor_gpu is None:
+                raise ValueError("plain_fp8_alpha_col requires alpha_col_tensor_gpu")
+        elif quantize_c:
             if (
                 quant_c_values_gpu is None
                 or quant_c_scale_rows_gpu is None
@@ -5802,6 +5842,7 @@ def _get_compiled_dense_gemm(
                     alpha_tensor_gpu,
                 ],
                 quant_c_tensors,
+                alpha_col_tensor_gpu,
             ),
             m,
             cuda_stream_from_int_or_current(stream_int),
@@ -6686,6 +6727,7 @@ def dense_gemm(
     x_bf16: Optional[torch.Tensor] = None,
     w_gscale: Optional[torch.Tensor] = None,
     plain_fp8: bool = False,
+    alpha_col: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Execute dense block-scaled GEMM for one expert-major batch stack.
 
@@ -6724,6 +6766,10 @@ def dense_gemm(
     ``plain_fp8``: emit non-block-scaled E4M3 warp MMA while reusing the
     SM12x dense pipeline. The scalar ``alpha`` carries the combined activation
     and weight dequantization scale.
+
+    ``alpha_col``: optional plain-FP8 decode-only FP32 output-channel scale
+    vector. The kernel multiplies the shared scalar ``alpha`` by one
+    per-output-channel factor during the direct M=1 global store path.
     """
     a_torch, sfa_torch = lhs
     b_torch, sfb_torch = rhs
@@ -6778,6 +6824,8 @@ def dense_gemm(
         raise ValueError(
             "plain_fp8 does not support tiled/quantized output or replicated scales"
         )
+    if alpha_col is not None and not plain_fp8:
+        raise ValueError("alpha_col requires plain_fp8=True")
     if b_packed:
         if mxfp6_fmt_b is None:
             raise ValueError("b_packed requires an MX-FP6 ab_dtype")
@@ -6929,6 +6977,25 @@ def dense_gemm(
     else:
         kernel_c_l = l
     alpha_is_one = alpha is None
+    plain_fp8_alpha_col = alpha_col is not None
+    if plain_fp8_alpha_col:
+        if swap_ab:
+            raise ValueError("alpha_col plain-FP8 path does not support swap_ab")
+        if split_k_output:
+            raise ValueError("alpha_col plain-FP8 path does not support split-K")
+        if m != 1:
+            raise ValueError(
+                f"alpha_col plain-FP8 path currently requires M=1, got M={m}"
+            )
+        if alpha_col.device != a_torch.device:
+            raise ValueError("alpha_col must be on the same device as A/B")
+        if alpha_col.dtype != torch.float32:
+            raise ValueError(f"alpha_col must be float32, got {alpha_col.dtype}")
+        if tuple(alpha_col.shape) not in ((n,), (n, 1)):
+            raise ValueError(
+                f"alpha_col must have shape {(n,)} or {(n, 1)}, got {tuple(alpha_col.shape)}"
+            )
+        alpha_col = alpha_col.reshape(n).contiguous()
     if alpha is None:
         alpha = _cached_alpha_one(a_torch.device)
     stream_int = cuda_stream_to_int(stream)
@@ -7185,6 +7252,7 @@ def dense_gemm(
             b_tile_major=False,
             alpha_is_one=alpha_is_one,
             plain_fp8=True,
+            plain_fp8_alpha_col=plain_fp8_alpha_col,
         )
         compiled_plain_fp8(
             a_tensor_gpu=a_torch,
@@ -7194,6 +7262,7 @@ def dense_gemm(
             c_tensor_gpu=c_tensor_gpu,
             alpha_tensor_gpu=alpha,
             stream_int=stream_int,
+            alpha_col_tensor_gpu=alpha_col,
         )
     else:
         torch.ops.sparkinfer.dense_gemm_launch(
