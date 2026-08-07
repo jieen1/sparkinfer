@@ -449,6 +449,56 @@ class PagedAttentionArena:
         )
 
 
+def _qwen36_verify_fixed_split_pages_from_env(
+    *,
+    mode: str,
+    kv_dtype: torch.dtype,
+    num_q_heads: int,
+    num_kv_heads: int,
+    head_dim_qk: int,
+    head_dim_vo: int,
+    page_size: int,
+    max_cache_seqlen: int,
+) -> int | None:
+    """Resolve SPARKINFER_QWEN36_VERIFY_FIXED_SPLITS to fixed_split_size pages.
+
+    Restores the historical oracle/qwen36_vllm split-KV contract
+    (``_DECODE_TARGET_SPLITS_PER_REQ = 32`` ->
+    ``kv_split_size = ceil(slot_capacity_tokens / 32)``): chunk boundaries
+    become fixed multiples of the split size, independent of BOTH the live
+    batch and the live length.  The adaptive replay re-chunking gate below
+    excludes fixed_split_size plans, so the captured chunk size is kept for
+    every replay.  The trade: adaptive SM-fill re-chunking is replaced by
+    deterministic per-length split-KV numerics (see qwen-sm120-runtime
+    notes/2026-08-06-128k-c4-parity-profiling.md section 18 for the
+    attribution that motivated this knob).
+
+    Returns None when the knob is unset or the geometry is not the Qwen3.6
+    verifier family (fp8 KV, head_dim 256, page 128).
+    """
+    raw = os.environ.get("SPARKINFER_QWEN36_VERIFY_FIXED_SPLITS")
+    if raw is None or raw == "":
+        return None
+    try:
+        splits = int(raw)
+    except ValueError:
+        return None
+    if splits <= 0:
+        return None
+    if (
+        mode != "verify"
+        or kv_dtype != torch.float8_e4m3fn
+        or head_dim_qk != 256
+        or head_dim_vo != 256
+        or page_size != 128
+        or num_kv_heads <= 0
+        or num_q_heads <= num_kv_heads
+    ):
+        return None
+    worst_pages = max((int(max_cache_seqlen) + page_size - 1) // page_size, 1)
+    return max((worst_pages + splits - 1) // splits, 1)
+
+
 @dataclass(kw_only=True)
 class PagedAttentionWorkspace:
     arena: PagedAttentionArena | None = None
@@ -1352,6 +1402,7 @@ class PagedAttentionWorkspace:
         max_cache_seqlen: int,
         cu_seqlens_q: torch.Tensor,
         window_left: int = -1,
+        fixed_split_size: int | None = None,
     ) -> PagedAttentionWorkspace:
         if not self.use_cuda_graph:
             raise RuntimeError(
@@ -1393,10 +1444,22 @@ class PagedAttentionWorkspace:
         max_page_table = (
             (max_page_ids % num_cache_pages).unsqueeze(0).expand(batch, -1).contiguous()
         )
+        if fixed_split_size is None:
+            fixed_split_size = _qwen36_verify_fixed_split_pages_from_env(
+                mode=self.mode,
+                kv_dtype=self.kv_dtype,
+                num_q_heads=self.num_q_heads,
+                num_kv_heads=self.num_kv_heads,
+                head_dim_qk=self.head_dim_qk,
+                head_dim_vo=self.head_dim_vo,
+                page_size=self.page_size,
+                max_cache_seqlen=max_cache_seqlen,
+            )
         self.prepare(
             max_page_table,
             max_cache_seqlens,
             cu_seqlens_q,
+            fixed_split_size=fixed_split_size,
             window_left=window_left,
             active_total_q=total_q_capacity,
         )
@@ -2107,6 +2170,7 @@ class PagedAttentionWorkspace:
             adaptive_chunking=bool(
                 self.mode == "verify"
                 and self._plan.split_kv
+                and self._plan.fixed_split_size < 0
                 and self._plan.window_left < 0
                 and self._plan.page_size == 128
                 and self._plan.gqa_group_size == 6

@@ -2316,9 +2316,20 @@ def create_paged_plan(
     if regularized_decode_graph:
         padded_batch_size = _align_up(padded_batch_size, max(batch, 1))
     if new_batch_size > padded_batch_size:
-        raise ValueError(
-            "new_batch_size exceeds padded_batch_size; fixed_split_size is incompatible with the chosen graph budget"
-        )
+        if enable_cuda_graph and fixed_split_size > 0:
+            # Caller-fixed split contract (the workspace knob
+            # SPARKINFER_QWEN36_VERIFY_FIXED_SPLITS resolves to a
+            # fixed_split_size here): the heuristic SM-fill budget exists to
+            # *choose* a chunk size.  When the chunk size is caller-fixed,
+            # the worst-case worklist IS the envelope -- buffers and launch
+            # extents are capture-static, so grow to it.  Replay masks the
+            # idle work items through block_valid_mask exactly like the
+            # frozen worst-case plan does.
+            padded_batch_size = new_batch_size
+        else:
+            raise ValueError(
+                "new_batch_size exceeds padded_batch_size; fixed_split_size is incompatible with the chosen graph budget"
+            )
     if force_split_kv:
         split_kv = True
     total_num_partial_rows = o_indptr[-1] if split_kv else 0
