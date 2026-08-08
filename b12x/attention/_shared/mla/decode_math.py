@@ -874,64 +874,63 @@ def s1_qk_nope_dsv4_bf16(
     kv_smem_stride: cutlass.Constexpr,
     scale_bytes_per_token: cutlass.Constexpr,
 ):
-    """S1 (DSV4 bf16-Q): BF16 QK-NoPE, A = Q (global), B = K (dequant).
+    """S1 (DSV4 bf16-Q): BF16 QK-NoPE, A = K (dequant), B = Q (global).
 
-    The s3 mask pairs (qk[0], qk[2]) = the same candidate column c0 =
-    tid*2 -- the C/D fragment of the m16n8k16.row.col MMA has the heads on
-    the rows (g/g+8) and the candidates on the columns (2t/2t+1), so A
-    (16x16) = Q (16 heads x 16 k), B (16x8) = K (16 k x 8 candidates).
-    PTX fragments (g = lane>>2, t = lane%4): A: a0/a1/a2/a3 = (row g/g+8,
-    col 2t/2t+8) bf16 pairs; B: b0/b1 = (k-row 2t/2t+8, n-col g) pairs.
-    A's Q is read per-lane from global. B's K is the raw e4m3 cache bytes
-    dequantized in registers with the per-(candidate, 64-tile) ue8m0 pow2
-    footer scale -- bit-exact with the eager round-trip.
+    PTX m16n8k16.row.col fragments (g = lane>>2, t = lane%4): A (16x16)
+    a0/a1/a2/a3 = (row g/g+8, col 2t/2t+8) bf16 pairs; B (16x8) b0/b1 =
+    (k-row 2t/2t+8, n-col g) pairs; C/D (16x8) d0..d3 = (g/g+8, 2t/2t+1).
+    A = K (16 candidates x 16 k), B = Q (16 k x 8 heads). A's K is the raw
+    e4m3 cache bytes dequantized in registers with the per-(candidate,
+    64-tile) ue8m0 pow2 footer scale -- bit-exact with the eager
+    round-trip. B's Q is read per-lane from global (no smem staging; the
+    SM120 budget cannot hold a bf16 Q staging).
     """
     gid = lane >> Int32(2)
     tid = lane & Int32(3)
-    cand = warp_first_cand + gid
+    cand0 = warp_first_cand + gid
+    cand1 = cand0 + Int32(8)
     k0 = tid * Int32(2)
 
     for blk in cutlass.range_constexpr(num_scales):
-        sfa = _ld_u8_zext(
+        sfa0 = _ld_u8_zext(
             kv_sc_base_addr,
-            cand * Int32(scale_bytes_per_token) + Int32(blk),
+            cand0 * Int32(scale_bytes_per_token) + Int32(blk),
         )
-        scale_f = _ue8m0_zext_byte_to_fp32(sfa)
+        sfa1 = _ld_u8_zext(
+            kv_sc_base_addr,
+            cand1 * Int32(scale_bytes_per_token) + Int32(blk),
+        )
+        scale_f0 = _ue8m0_zext_byte_to_fp32(sfa0)
+        scale_f1 = _ue8m0_zext_byte_to_fp32(sfa1)
         for ks in cutlass.range_constexpr(quant_tile // 16):
             ko = Int32(blk) * Int32(quant_tile) + Int32(ks) * Int32(16)
-            a0, _ = ld_global_nc_v2_u32(
+            a0 = _dsv4_e4m3_pair_bfloat2(
+                kv_fp8_base_addr, cand0, ko + k0, scale_f0,
+                kv_smem_stride=kv_smem_stride,
+            )
+            a1 = _dsv4_e4m3_pair_bfloat2(
+                kv_fp8_base_addr, cand1, ko + k0, scale_f1,
+                kv_smem_stride=kv_smem_stride,
+            )
+            a2 = _dsv4_e4m3_pair_bfloat2(
+                kv_fp8_base_addr, cand0, ko + k0 + Int32(8), scale_f0,
+                kv_smem_stride=kv_smem_stride,
+            )
+            a3 = _dsv4_e4m3_pair_bfloat2(
+                kv_fp8_base_addr, cand1, ko + k0 + Int32(8), scale_f1,
+                kv_smem_stride=kv_smem_stride,
+            )
+            b0, _ = ld_global_nc_v2_u32(
                 get_ptr_as_int64(
                     q_token,
                     cute.crd2idx((head_base + gid, ko + k0), q_token.layout),
                 )
             )
-            a1, _ = ld_global_nc_v2_u32(
-                get_ptr_as_int64(
-                    q_token,
-                    cute.crd2idx((head_base + gid + Int32(8), ko + k0), q_token.layout),
-                )
-            )
-            a2, _ = ld_global_nc_v2_u32(
+            b1, _ = ld_global_nc_v2_u32(
                 get_ptr_as_int64(
                     q_token,
                     cute.crd2idx((head_base + gid, ko + k0 + Int32(8)), q_token.layout),
                 )
-            )
-            a3, _ = ld_global_nc_v2_u32(
-                get_ptr_as_int64(
-                    q_token,
-                    cute.crd2idx(
-                        (head_base + gid + Int32(8), ko + k0 + Int32(8)), q_token.layout
-                    ),
-                )
-            )
-            b0 = _dsv4_e4m3_pair_bfloat2(
-                kv_fp8_base_addr, cand, ko + k0, scale_f,
-                kv_smem_stride=kv_smem_stride,
-            )
-            b1 = _dsv4_e4m3_pair_bfloat2(
-                kv_fp8_base_addr, cand, ko + k0 + Int32(8), scale_f,
-                kv_smem_stride=kv_smem_stride,
             )
             qk[0], qk[1], qk[2], qk[3] = mma_m16n8k16_f32_bf16(
                 qk[0],

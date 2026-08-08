@@ -1817,7 +1817,9 @@ class UnifiedDecodeKernel:
                     cute.make_layout(int(L.w_head_sc_bytes // 4)),
                 )
 
-            if cutlass.const_expr(t.scale_format == ScaleFormat.NVFP4_E4M3):
+            if cutlass.const_expr(
+                t.scale_format == ScaleFormat.NVFP4_E4M3 or t.dsv4_bf16_q
+            ):
                 s0_load_q_bf16_to_smem(
                     q_token,
                     q_fp8_stage,
@@ -1833,6 +1835,7 @@ class UnifiedDecodeKernel:
                     num_threads=nt_stage,
                     barrier_id=2,
                     barrier_threads=bt_stage,
+                    stage_nope=(not t.dsv4_bf16_q),
                 )
             else:
                 s0_quantize_q_to_smem(
