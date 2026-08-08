@@ -618,9 +618,7 @@ def s1_qk_nope_block_scaled(
     A (Q) loaded via ldmatrix.x4 (FP8 A 16x32 for scale_format 0/1, BF16 A
     16x16 for scale_format 2); B follows the matching FP8 or BF16 path.
     """
-    print("DBG dispatcher traced", flush=True)
     if cutlass.const_expr(dsv4_bf16_q):
-        print("DBG bf16-q branch taken", flush=True)
         # DSV4 bf16-Q mode: Q is read per-lane from global (no FP8
         # quantization, no smem staging), K stays the raw e4m3 cache bytes
         # dequantized in registers; the BF16 MMA matches the official
@@ -2368,6 +2366,7 @@ def _dsv4_e4m3_scalar_bf16_u16(
 
 @cute.jit
 def s6_xv_nope_dsv4_bf16(
+    w_pre,
     acc_nope,
     sm_p_full_addr: Int32,
     kv_fp8_base_addr: Int32,
@@ -2383,11 +2382,16 @@ def s6_xv_nope_dsv4_bf16(
     nt_per_warp_xv: cutlass.Constexpr,  # 1 DSV4
     sm_p_stride: cutlass.Constexpr = 0,  # bf16 elems per sm_p row (0 -> BI)
     scale_bytes_per_token: cutlass.Constexpr = 8,
+    num_threads: cutlass.Constexpr = 128,
+    barrier_id: cutlass.Constexpr = 3,
+    barrier_threads: cutlass.Constexpr = 0,  # barrier width override (0 -> num_threads)
 ):
     """S6 (DSV4 bf16-Q): BF16 P.V over in-register dequantized e4m3 V.
 
-    The BF16 probabilities staged by S5 (sm_p_full) are used directly as the
-    A operand; each B scalar is dequantized from the raw e4m3 V byte with the
+    Like the H8 swap_ab path, the H8 QK emits a swapped score fragment, so
+    this variant stages its own ordinary [head, candidate] BF16 sm_p_full
+    (S5's fill runs on the non-H8 path only) before consuming it as the A
+    operand.  Each B scalar is dequantized from the raw e4m3 V byte with the
     per-(candidate, V-chunk) ue8m0 pow2 footer scale -- bit-exact with the
     eager round-trip, eliminating the w_fp8 e4m3 P requantization of the
     plain-FP8 XV path.
@@ -2395,6 +2399,26 @@ def s6_xv_nope_dsv4_bf16(
     p_stride = cutlass.const_expr(sm_p_stride if sm_p_stride else bi)
     gid = lane >> Int32(2)
     tid = lane & Int32(3)
+    head0 = tid * Int32(2)
+    head1 = head0 + Int32(1)
+    cand0 = warp_id * Int32(16) + gid
+    cand1 = cand0 + Int32(8)
+    st_shared_bf16_from_f32(
+        sm_p_full_addr + (head0 * Int32(p_stride) + cand0) * Int32(2), w_pre[0]
+    )
+    st_shared_bf16_from_f32(
+        sm_p_full_addr + (head1 * Int32(p_stride) + cand0) * Int32(2), w_pre[1]
+    )
+    st_shared_bf16_from_f32(
+        sm_p_full_addr + (head0 * Int32(p_stride) + cand1) * Int32(2), w_pre[2]
+    )
+    st_shared_bf16_from_f32(
+        sm_p_full_addr + (head1 * Int32(p_stride) + cand1) * Int32(2), w_pre[3]
+    )
+    cute.arch.barrier(
+        barrier_id=barrier_id,
+        number_of_threads=(barrier_threads if barrier_threads else num_threads),
+    )
     a_row = (lane & Int32(7)) + ((lane >> Int32(3)) & Int32(1)) * Int32(8)
     a_col = (lane >> Int32(4)) * Int32(8)
 
@@ -2419,20 +2443,35 @@ def s6_xv_nope_dsv4_bf16(
                     ent0 * Int32(scale_bytes_per_token) + Int32(vc),
                 )
                 scale_f = _ue8m0_zext_byte_to_fp32(sfa)
+                sfa1 = _ld_u8_zext(
+                    kv_sc_base_addr,
+                    (ent0 + Int32(1)) * Int32(scale_bytes_per_token) + Int32(vc),
+                )
+                scale_f1 = _ue8m0_zext_byte_to_fp32(sfa1)
+                sfa8 = _ld_u8_zext(
+                    kv_sc_base_addr,
+                    (ent0 + Int32(8)) * Int32(scale_bytes_per_token) + Int32(vc),
+                )
+                scale_f8 = _ue8m0_zext_byte_to_fp32(sfa8)
+                sfa9 = _ld_u8_zext(
+                    kv_sc_base_addr,
+                    (ent0 + Int32(9)) * Int32(scale_bytes_per_token) + Int32(vc),
+                )
+                scale_f9 = _ue8m0_zext_byte_to_fp32(sfa9)
                 v0 = _dsv4_e4m3_scalar_bf16_u16(
                     kv_fp8_base_addr, ent0, col, scale_f,
                     kv_smem_stride=kv_smem_stride,
                 )
                 v1 = _dsv4_e4m3_scalar_bf16_u16(
-                    kv_fp8_base_addr, ent0 + Int32(1), col, scale_f,
+                    kv_fp8_base_addr, ent0 + Int32(1), col, scale_f1,
                     kv_smem_stride=kv_smem_stride,
                 )
                 v8 = _dsv4_e4m3_scalar_bf16_u16(
-                    kv_fp8_base_addr, ent0 + Int32(8), col, scale_f,
+                    kv_fp8_base_addr, ent0 + Int32(8), col, scale_f8,
                     kv_smem_stride=kv_smem_stride,
                 )
                 v9 = _dsv4_e4m3_scalar_bf16_u16(
-                    kv_fp8_base_addr, ent0 + Int32(9), col, scale_f,
+                    kv_fp8_base_addr, ent0 + Int32(9), col, scale_f9,
                     kv_smem_stride=kv_smem_stride,
                 )
                 b0 = v0 | (v1 << Uint32(16))

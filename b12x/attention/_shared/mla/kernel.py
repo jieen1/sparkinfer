@@ -959,7 +959,6 @@ class UnifiedDecodeKernel:
                         h8_rope_addr = kv_fp8_b + Int32(t.kv_smem_stride)
                         h8_rope_stride = staged_kv_stride
                     elif cutlass.const_expr(t.dsv4_bf16_q):
-                        print("DBG H8 bf16-q branch", flush=True)
                         qk = s1_qk_nope_dsv4_bf16(
                             qk,
                             q_token,
@@ -1061,21 +1060,30 @@ class UnifiedDecodeKernel:
                             barrier_id=3,
                         )
                     elif cutlass.const_expr(t.dsv4_bf16_q):
-                        acc_nope = s6_xv_nope_dsv4_bf16(
+                        acc_nope = s6_xv_nope_dsv4_h8_swap_ab(
+                            w_pre,
                             acc_nope,
-                            sm_p_full_addr,
                             kv_fp8_b,
                             kv_sc_b,
+                            w_head_sc_view,
+                            w_fp8_addr,
+                            sm_p_full_addr,
                             warp_id,
                             lane,
+                            tid,
                             n_v_chunks=t.n_v_chunks,
                             v_chunk=t.quant_tile,
+                            hpb=t.hpb,
                             bi=t.bi,
+                            sm_p_stride=L.sm_p_full_stride,
                             kv_smem_stride=staged_kv_stride,
+                            w_fp8_stride=t.bi + 16,
                             n_warps=4,
                             nt_per_warp_xv=t.nt_per_warp_xv,
-                            sm_p_stride=L.sm_p_full_stride,
                             scale_bytes_per_token=8,
+                            num_threads=self.math_threads,
+                            barrier_id=3,
+                            packed_footer_words=self.native_dsv4_h16,
                         )
                     else:
                         acc_nope = s6_xv_nope_dsv4_h8_swap_ab(
@@ -2072,6 +2080,7 @@ class UnifiedDecodeKernel:
                         )
                     elif cutlass.const_expr(t.dsv4_bf16_q):
                         acc_nope = s6_xv_nope_dsv4_bf16(
+                            w_pre,
                             acc_nope,
                             sm_p_stage,
                             kv_fp8_b,
@@ -2086,6 +2095,9 @@ class UnifiedDecodeKernel:
                             nt_per_warp_xv=t.nt_per_warp_xv,
                             sm_p_stride=L.sm_p_full_stride,
                             scale_bytes_per_token=8,
+                            num_threads=nt_stage,
+                            barrier_id=3,
+                            barrier_threads=bt_stage,
                         )
                     else:
                         acc_nope = s6_xv_nope_dsv4_h8_swap_ab(
@@ -2527,7 +2539,6 @@ def _sparse_mla_decode_grid_flat_launch(
     if traits.model_type == ModelType.DSV4 and _env_dsv4_bf16_q_enabled():
         # DSV4 bf16-Q numerics mode: no FP8 Q quantization, BF16 QK MMA.
         traits = replace(traits, dsv4_bf16_q=True)
-        print("DBG bf16-q traits active", flush=True)
     layout = make_smem_layout(traits)
     hpb = int(traits.hpb)
     d_v = int(traits.d_v)
