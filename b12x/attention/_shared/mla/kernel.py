@@ -49,6 +49,7 @@ from .decode_math import (
     s4_online_softmax_glm_h8_swap_ab,
     s5_fill_sm_p_full,
     s6_xv_nope,
+    s6_xv_nope_dsv4_bf16,
     s6_xv_nope_dsv4_h8_swap_ab,
     s6_xv_nope_glm_h8_swap_ab,
     s6b_xv_rope,
@@ -1059,6 +1060,23 @@ class UnifiedDecodeKernel:
                             num_threads=self.math_threads,
                             barrier_id=3,
                         )
+                    elif cutlass.const_expr(t.dsv4_bf16_q):
+                        acc_nope = s6_xv_nope_dsv4_bf16(
+                            acc_nope,
+                            sm_p_full_addr,
+                            kv_fp8_b,
+                            kv_sc_b,
+                            warp_id,
+                            lane,
+                            n_v_chunks=t.n_v_chunks,
+                            v_chunk=t.quant_tile,
+                            bi=t.bi,
+                            kv_smem_stride=staged_kv_stride,
+                            n_warps=4,
+                            nt_per_warp_xv=t.nt_per_warp_xv,
+                            sm_p_stride=L.sm_p_full_stride,
+                            scale_bytes_per_token=8,
+                        )
                     else:
                         acc_nope = s6_xv_nope_dsv4_h8_swap_ab(
                             w_pre,
@@ -2051,6 +2069,23 @@ class UnifiedDecodeKernel:
                             nt_per_warp_xv=t.nt_per_warp_xv,
                             num_threads=self.math_threads,
                             barrier_id=3,
+                        )
+                    elif cutlass.const_expr(t.dsv4_bf16_q):
+                        acc_nope = s6_xv_nope_dsv4_bf16(
+                            acc_nope,
+                            sm_p_stage,
+                            kv_fp8_b,
+                            kv_sc_b,
+                            warp_sel,
+                            lane,
+                            n_v_chunks=t.n_v_chunks,
+                            v_chunk=t.quant_tile,
+                            bi=t.bi,
+                            kv_smem_stride=staged_kv_stride,
+                            n_warps=4,
+                            nt_per_warp_xv=t.nt_per_warp_xv,
+                            sm_p_stride=L.sm_p_full_stride,
+                            scale_bytes_per_token=8,
                         )
                     else:
                         acc_nope = s6_xv_nope_dsv4_h8_swap_ab(

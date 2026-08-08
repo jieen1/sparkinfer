@@ -2348,6 +2348,116 @@ def s6_xv_nope_nvfp4_bf16(
 
 
 @cute.jit
+def _dsv4_e4m3_scalar_bf16_u16(
+    kv_fp8_base_addr: Int32,
+    entry: Int32,
+    dim: Int32,
+    scale_f: Float32,
+    *,
+    kv_smem_stride: cutlass.Constexpr,
+) -> Uint32:
+    pair = _dsv4_e4m3_pair_bfloat2(
+        kv_fp8_base_addr,
+        entry,
+        dim & ~Int32(1),
+        scale_f,
+        kv_smem_stride=kv_smem_stride,
+    )
+    return _bf16x2_extract_lane_u16(pair, dim & Int32(1))
+
+
+@cute.jit
+def s6_xv_nope_dsv4_bf16(
+    acc_nope,
+    sm_p_full_addr: Int32,
+    kv_fp8_base_addr: Int32,
+    kv_sc_base_addr: Int32,
+    warp_id: Int32,
+    lane: Int32,
+    *,
+    n_v_chunks: cutlass.Constexpr,  # 7
+    v_chunk: cutlass.Constexpr,  # 64
+    bi: cutlass.Constexpr,  # 64
+    kv_smem_stride: cutlass.Constexpr,  # 592 (H8 packed) / 464 (generic)
+    n_warps: cutlass.Constexpr,  # 8
+    nt_per_warp_xv: cutlass.Constexpr,  # 1 DSV4
+    sm_p_stride: cutlass.Constexpr = 0,  # bf16 elems per sm_p row (0 -> BI)
+    scale_bytes_per_token: cutlass.Constexpr = 8,
+):
+    """S6 (DSV4 bf16-Q): BF16 P.V over in-register dequantized e4m3 V.
+
+    The BF16 probabilities staged by S5 (sm_p_full) are used directly as the
+    A operand; each B scalar is dequantized from the raw e4m3 V byte with the
+    per-(candidate, V-chunk) ue8m0 pow2 footer scale -- bit-exact with the
+    eager round-trip, eliminating the w_fp8 e4m3 P requantization of the
+    plain-FP8 XV path.
+    """
+    p_stride = cutlass.const_expr(sm_p_stride if sm_p_stride else bi)
+    gid = lane >> Int32(2)
+    tid = lane & Int32(3)
+    a_row = (lane & Int32(7)) + ((lane >> Int32(3)) & Int32(1)) * Int32(8)
+    a_col = (lane >> Int32(4)) * Int32(8)
+
+    for vc in cutlass.range_constexpr(n_v_chunks):
+        for nt in cutlass.range_constexpr(nt_per_warp_xv):
+            dim_base = Int32(vc) * Int32(v_chunk) + (
+                Int32(nt) * Int32(n_warps) + warp_id
+            ) * Int32(8)
+            col = dim_base + gid
+            xv0 = Float32(0.0)
+            xv1 = Float32(0.0)
+            xv2 = Float32(0.0)
+            xv3 = Float32(0.0)
+            for ks in cutlass.range_constexpr(bi // 16):
+                k_base = Int32(ks) * Int32(16)
+                a_byte = (a_row * Int32(p_stride) + (k_base + a_col)) * Int32(2)
+                a0, a1, a2, a3 = ldmatrix_m8n8x4_b16(sm_p_full_addr + a_byte)
+
+                ent0 = k_base + tid * Int32(2)
+                sfa = _ld_u8_zext(
+                    kv_sc_base_addr,
+                    ent0 * Int32(scale_bytes_per_token) + Int32(vc),
+                )
+                scale_f = _ue8m0_zext_byte_to_fp32(sfa)
+                v0 = _dsv4_e4m3_scalar_bf16_u16(
+                    kv_fp8_base_addr, ent0, col, scale_f,
+                    kv_smem_stride=kv_smem_stride,
+                )
+                v1 = _dsv4_e4m3_scalar_bf16_u16(
+                    kv_fp8_base_addr, ent0 + Int32(1), col, scale_f,
+                    kv_smem_stride=kv_smem_stride,
+                )
+                v8 = _dsv4_e4m3_scalar_bf16_u16(
+                    kv_fp8_base_addr, ent0 + Int32(8), col, scale_f,
+                    kv_smem_stride=kv_smem_stride,
+                )
+                v9 = _dsv4_e4m3_scalar_bf16_u16(
+                    kv_fp8_base_addr, ent0 + Int32(9), col, scale_f,
+                    kv_smem_stride=kv_smem_stride,
+                )
+                b0 = v0 | (v1 << Uint32(16))
+                b1 = v8 | (v9 << Uint32(16))
+                xv0, xv1, xv2, xv3 = mma_m16n8k16_f32_bf16(
+                    xv0,
+                    xv1,
+                    xv2,
+                    xv3,
+                    a0,
+                    a1,
+                    a2,
+                    a3,
+                    b0,
+                    b1,
+                )
+            at = vc * nt_per_warp_xv + nt
+            acc_nope[at][0] = acc_nope[at][0] + xv0
+            acc_nope[at][1] = acc_nope[at][1] + xv1
+            acc_nope[at][2] = acc_nope[at][2] + xv2
+            acc_nope[at][3] = acc_nope[at][3] + xv3
+    return acc_nope
+
+
+@cute.jit
 def s6_xv_nope_glm_h8_swap_ab(
     w_pre,
     acc_nope,
