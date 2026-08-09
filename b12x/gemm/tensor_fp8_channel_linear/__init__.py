@@ -6,7 +6,7 @@ scale-factor storage once, and records one FP32 scale per output channel.
 The kernel fuses ``row_scale * channel_scale`` into the direct M=1 epilogue.
 
 Example:
-    from sparkinfer.gemm import tensor_fp8_channel_linear
+    from b12x.gemm import tensor_fp8_channel_linear
 
     packed = tensor_fp8_channel_linear.pack_weight(weight_fp8, channel_scale)
     output = tensor_fp8_channel_linear.mm(input_fp8, packed, row_scale)

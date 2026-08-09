@@ -27,7 +27,7 @@ notes already document those two disagreeing by ~30 ULP for the same
 tokens.
 
 Example:
-    from sparkinfer.attention import gated_delta_rule
+    from b12x.attention import gated_delta_rule
 
     out, states = gated_delta_rule.fused_recurrent_gated_delta_rule_multistep(
         q, k, v, g, beta, initial_state,

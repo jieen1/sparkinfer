@@ -5,8 +5,8 @@ from dataclasses import dataclass
 
 import torch
 
-from sparkinfer._lib.dense_gemm import dense_gemm
-from sparkinfer.gemm.tensor_fp8_linear._kernel import (
+from b12x._lib.dense_gemm import dense_gemm
+from b12x.gemm.tensor_fp8_linear._kernel import (
     MXFP8_SCALE_VEC_SIZE,
     _check_gpu_tensor,
     _cached_unit_scale_mma,
