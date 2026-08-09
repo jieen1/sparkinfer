@@ -304,6 +304,7 @@ def test_compressed_mla_page_byte_widths_match_padded_layout() -> None:
 def test_compressed_mla_decode_does_not_pin_flash_tp2_heads_by_default() -> None:
     signature = inspect.signature(compressed_mla_decode_forward)
     assert signature.parameters["expected_num_q_heads"].default is None
+    assert signature.parameters["forced_num_splits"].default is None
 
 
 def test_compressed_mla_mtp_graph_rows_keep_decode_split_contract() -> None:

@@ -72,6 +72,7 @@ def compressed_mla_decode_forward(
     lse_scale: Literal["base2", "natural"] = "base2",
     backend: str | None = None,
     out: torch.Tensor | None = None,
+    forced_num_splits: int | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Run compressed sparse MLA decode directly from compressed KV pages.
 
@@ -292,6 +293,7 @@ def compressed_mla_decode_forward(
         return_lse=return_lse,
         lse_scale=lse_scale,
         out=out,
+        forced_num_splits=forced_num_splits,
     )
 
 
