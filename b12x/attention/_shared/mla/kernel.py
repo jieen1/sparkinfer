@@ -2913,7 +2913,11 @@ def run_unified_decode(
         _nc8, _ns8, _ = plan_unified_decode_splits(
             topk=topk,
             max_chunks=max_chunks,
-            forced_num_splits=forced_num_splits,
+            # An explicit reduction partition is a numeric contract, not a
+            # request to change the H8/H16 specialization.  Keep the head-
+            # block policy on its normal wave-balanced launch estimate; the
+            # actual launch below still honors ``forced_num_splits``.
+            forced_num_splits=None,
             num_tokens=rows,
             h_blocks=heads // 8,
             sm_count=sm_count,
