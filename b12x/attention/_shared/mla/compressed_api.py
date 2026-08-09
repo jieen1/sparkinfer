@@ -13,7 +13,7 @@ from .api import (
     _validate_tensor_storage_bounds,
 )
 from .compressed_config import (
-    compressed_mla_split_chunks_for_contract,
+    compressed_mla_split_chunks_for_contract as _compressed_mla_split_chunks_for_contract,
 )
 from .compressed_reference import (
     COMPRESSED_MLA_BYTES_PER_TOKEN,
@@ -24,6 +24,7 @@ from .compressed_reference import (
 
 
 _LN2 = math.log(2.0)
+compressed_mla_split_chunks_for_contract = _compressed_mla_split_chunks_for_contract
 
 
 def _should_use_sm121_single_pass_decode(
@@ -73,12 +74,16 @@ def compressed_mla_decode_forward(
     backend: str | None = None,
     out: torch.Tensor | None = None,
     forced_num_splits: int | None = None,
+    forced_dsv4_h16: bool | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Run compressed sparse MLA decode directly from compressed KV pages.
 
     ``out``, when given, is the final O destination: the kernel/merge writes it
     directly (no workspace-to-caller copy). Must be a contiguous BF16
     [rows, heads, 512] tensor on q's device; anything else raises.
+
+    ``forced_dsv4_h16`` overrides the DSV4 H8/H16 policy when set.  The
+    specialization's normal shape constraints remain authoritative.
     """
 
     if lse_scale not in ("base2", "natural"):
@@ -106,9 +111,9 @@ def compressed_mla_decode_forward(
     scratch = getattr(binding, "scratch", None)
     if scratch is None:
         raise TypeError("compressed MLA binding is missing scratch")
-    q_all = getattr(binding, "q")
-    swa_indices = getattr(binding, "swa_indices")
-    swa_topk_lengths = getattr(binding, "swa_lengths")
+    q_all = binding.q
+    swa_indices = binding.swa_indices
+    swa_topk_lengths = binding.swa_lengths
     indexed_indices = getattr(binding, "indexed_indices", None)
     indexed_topk_lengths = getattr(binding, "indexed_lengths", None)
     indexed_page_table = getattr(binding, "indexed_page_table", None)
@@ -294,6 +299,7 @@ def compressed_mla_decode_forward(
         lse_scale=lse_scale,
         out=out,
         forced_num_splits=forced_num_splits,
+        forced_dsv4_h16=forced_dsv4_h16,
     )
 
 

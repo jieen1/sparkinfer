@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import inspect
 import math
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -305,6 +306,139 @@ def test_compressed_mla_decode_does_not_pin_flash_tp2_heads_by_default() -> None
     signature = inspect.signature(compressed_mla_decode_forward)
     assert signature.parameters["expected_num_q_heads"].default is None
     assert signature.parameters["forced_num_splits"].default is None
+    assert signature.parameters["forced_dsv4_h16"].default is None
+
+
+@pytest.mark.parametrize("forced_dsv4_h16", [False, True])
+def test_compressed_mla_decode_forwards_forced_dsv4_h16(
+    monkeypatch: pytest.MonkeyPatch,
+    forced_dsv4_h16: bool,
+) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_run_unified_decode(**kwargs):
+        captured.update(kwargs)
+        q_all = kwargs["q_all"]
+        return torch.zeros(
+            (int(q_all.shape[0]), int(q_all.shape[1]), _COMPRESSED_HEAD_DIM),
+            dtype=torch.bfloat16,
+            device=q_all.device,
+        )
+
+    import b12x.attention._shared.mla.kernel as kernel_impl
+
+    monkeypatch.setattr(compressed_api_impl, "_use_sm120_sparse_mla", lambda **_: True)
+    monkeypatch.setattr(
+        compressed_api_impl, "_validate_compressed_cache_layout", lambda *args, **kwargs: None
+    )
+    monkeypatch.setattr(
+        compressed_api_impl, "_validate_compressed_mla_scratch", lambda **kwargs: None
+    )
+    monkeypatch.setattr(
+        compressed_api_impl, "_should_use_sm121_single_pass_decode", lambda **kwargs: False
+    )
+    monkeypatch.setattr(kernel_impl, "run_unified_decode", fake_run_unified_decode)
+
+    q = torch.zeros((1, _LOCAL_Q_HEADS, _COMPRESSED_HEAD_DIM), dtype=torch.bfloat16)
+    binding = SimpleNamespace(
+        scratch=SimpleNamespace(mode="decode"),
+        q=q,
+        swa_indices=torch.zeros((1, 16), dtype=torch.int32),
+        swa_lengths=torch.full((1,), 16, dtype=torch.int32),
+        indexed_indices=None,
+        indexed_lengths=None,
+        indexed_page_table=None,
+    )
+    swa_cache = torch.zeros((1, compressed_mla_page_nbytes(COMPRESSED_MLA_DSV4_PAGE_SIZE)), dtype=torch.uint8)
+
+    out = compressed_api_impl.compressed_mla_decode_forward(
+        binding=binding,
+        swa_k_cache=swa_cache,
+        sm_scale=_SM_SCALE,
+        forced_dsv4_h16=forced_dsv4_h16,
+    )
+
+    assert out.shape == (1, _LOCAL_Q_HEADS, _COMPRESSED_HEAD_DIM)
+    assert captured["forced_dsv4_h16"] is forced_dsv4_h16
+
+
+@pytest.mark.parametrize(
+    ("forced_dsv4_h16", "env_mode", "auto_result", "heads", "expected_h16", "expect_auto"),
+    [
+        (None, None, True, 32, True, True),
+        (False, True, True, 32, False, False),
+        (True, False, True, 24, False, False),
+    ],
+)
+def test_run_unified_decode_forced_dsv4_h16_contract(
+    monkeypatch: pytest.MonkeyPatch,
+    forced_dsv4_h16: bool | None,
+    env_mode: bool | None,
+    auto_result: bool,
+    heads: int,
+    expected_h16: bool,
+    expect_auto: bool,
+) -> None:
+    import b12x.attention._shared.mla.kernel as kernel_impl
+    import b12x.attention._shared.mla.merge as merge_impl
+
+    auto_calls = {"count": 0}
+
+    def fake_auto(**kwargs):
+        auto_calls["count"] += 1
+        return auto_result
+
+    monkeypatch.setattr(kernel_impl, "_env_dsv4_h16_native_mode", lambda: env_mode)
+    monkeypatch.setattr(kernel_impl, "_dsv4_h16_auto", fake_auto)
+    monkeypatch.setattr(
+        kernel_impl,
+        "plan_unified_decode_splits",
+        lambda **kwargs: (1, 1, 1),
+    )
+    monkeypatch.setattr(
+        torch.ops.b12x,
+        "sparse_mla_sm120_decode_grid",
+        lambda *args, **kwargs: None,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        merge_impl,
+        "build_sparse_mla_split_decode_merge_binding",
+        lambda **kwargs: SimpleNamespace(**kwargs),
+    )
+    monkeypatch.setattr(
+        merge_impl, "run_sparse_mla_split_decode_merge", lambda binding: None
+    )
+
+    rows = 1
+    topk = 64
+    max_chunks = 4
+    workspace = SimpleNamespace(
+        max_chunks_per_row=max_chunks,
+        tmp_output=torch.zeros(
+            (rows, heads, max_chunks, _COMPRESSED_HEAD_DIM), dtype=torch.bfloat16
+        ),
+        tmp_lse=torch.zeros((rows, heads, max_chunks), dtype=torch.float32),
+        output_buffer=torch.zeros(
+            (rows, heads, _COMPRESSED_HEAD_DIM), dtype=torch.bfloat16
+        ),
+        num_chunks_ptr=torch.zeros((1,), dtype=torch.int32),
+    )
+
+    out = kernel_impl.run_unified_decode(
+        q_all=torch.zeros((rows, heads, _COMPRESSED_HEAD_DIM), dtype=torch.bfloat16),
+        swa_k_cache=torch.zeros((1, COMPRESSED_MLA_DSV4_PAGE_SIZE, 584), dtype=torch.uint8),
+        swa_indices=torch.zeros((rows, topk), dtype=torch.int32),
+        swa_topk_lengths=torch.full((rows,), topk, dtype=torch.int32),
+        workspace=workspace,
+        sm_scale=_SM_SCALE,
+        swa_page_size=COMPRESSED_MLA_DSV4_PAGE_SIZE,
+        forced_dsv4_h16=forced_dsv4_h16,
+    )
+
+    assert out.shape == (rows, heads, _COMPRESSED_HEAD_DIM)
+    assert kernel_impl.LAST_DECODE_PLAN["native_dsv4_h16"] is expected_h16
+    assert auto_calls["count"] == int(expect_auto)
 
 
 def test_compressed_mla_mtp_graph_rows_keep_decode_split_contract() -> None:
@@ -491,15 +625,18 @@ def test_compressed_mla_fixed_workspace_split_plan_uses_contract_not_live_shape(
         max_page_table_width=page_table_width,
     )
 
-    with torch.inference_mode(), torch.no_grad():
-        with pytest.raises(ValueError, match="mapped indexed_page_table"):
-            compressed_api_impl.compressed_mla_decode_forward(
-                swa_k_cache=swa_cache.view(torch.float8_e4m3fn),
-                binding=binding,
-                indexed_k_cache=indexed_cache,
-                indexed_page_size=COMPRESSED_MLA_C4_PAGE_SIZE,
-                sm_scale=_SM_SCALE,
-            )
+    with (
+        torch.inference_mode(),
+        torch.no_grad(),
+        pytest.raises(ValueError, match="mapped indexed_page_table"),
+    ):
+        compressed_api_impl.compressed_mla_decode_forward(
+            swa_k_cache=swa_cache.view(torch.float8_e4m3fn),
+            binding=binding,
+            indexed_k_cache=indexed_cache,
+            indexed_page_size=COMPRESSED_MLA_C4_PAGE_SIZE,
+            sm_scale=_SM_SCALE,
+        )
 
 
 @torch.inference_mode()

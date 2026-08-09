@@ -2737,6 +2737,7 @@ def run_unified_decode(
     return_lse: bool = False,
     lse_scale: str = "base2",
     forced_num_splits: int | None = None,
+    forced_dsv4_h16: bool | None = None,
     out: torch.Tensor | None = None,
     scale_format_override: int | None = None,
     fp8_rope_override: bool | None = None,
@@ -2905,7 +2906,11 @@ def run_unified_decode(
         and heads % 16 == 0
         and num_main_chunks + num_extra_chunks <= _DSV4_H8_MAX_CHUNKS
     )
-    h16_mode = _env_dsv4_h16_native_mode()
+    h16_mode = (
+        _env_dsv4_h16_native_mode()
+        if forced_dsv4_h16 is None
+        else bool(forced_dsv4_h16)
+    )
     if h16_allowed and h16_mode is None:
         # AUTO policy: pre-plan the H8 grid, then choose by regime (see
         # _dsv4_h16_auto): gather-bound many-chunk shapes and >1.4-wave H8
