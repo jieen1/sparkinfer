@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import torch
 
-from ..._lib.gating import has_triton, is_sparkinfer
+from ..._lib.gating import has_triton, is_b12x
 from .kernel import (
     fused_recurrent_gdn_multistep_fwd,
     fused_recurrent_gdn_multistep_indexed_fwd,
@@ -304,7 +304,7 @@ def fused_recurrent_gated_delta_rule_multistep_indexed(
 def is_supported(device=None) -> bool:
     """True on SM120/SM121 with triton (this op is pure Triton -- unlike
     most of sparkinfer, it does not need the CUTLASS DSL)."""
-    return is_sparkinfer(device) and has_triton()
+    return is_b12x(device) and has_triton()
 
 
 def clear_caches() -> None:
