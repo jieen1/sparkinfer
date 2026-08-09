@@ -4,9 +4,9 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from sparkinfer.norm.mhc._impl import SPARKINFERMHCScratchCaps, plan_mhc_scratch, sparkinfer_mhc_post, sparkinfer_mhc_post_pre, sparkinfer_mhc_pre
+from b12x.norm.mhc._impl import B12XMHCScratchCaps, plan_mhc_scratch, b12x_mhc_post, b12x_mhc_post_pre, b12x_mhc_pre
 
-from tests._reference.helpers import require_sparkinfer
+from tests._reference.helpers import require_b12x
 
 
 def _mhc_pre_reference(
@@ -82,7 +82,7 @@ def _make_mhc_binding(
 ):
     max_tokens = max(tokens, expected_m or tokens)
     plan = plan_mhc_scratch(
-        SPARKINFERMHCScratchCaps(
+        B12XMHCScratchCaps(
             device=device,
             max_tokens=max_tokens,
             hidden_size=hidden_size,
@@ -105,8 +105,8 @@ def _make_mhc_binding(
 
 
 @pytest.mark.parametrize("tokens", [1, 3, 8])
-def test_sparkinfer_mhc_pre_broadcast_match_reference(tokens: int) -> None:
-    device = require_sparkinfer()
+def test_b12x_mhc_pre_broadcast_match_reference(tokens: int) -> None:
+    device = require_b12x()
     hidden_size = 4096
     _, x, fn, scale, bias = _make_inputs(
         tokens=tokens,
@@ -129,7 +129,7 @@ def test_sparkinfer_mhc_pre_broadcast_match_reference(tokens: int) -> None:
         .contiguous()
     )
 
-    residual, post, comb, y = sparkinfer_mhc_pre(
+    residual, post, comb, y = b12x_mhc_pre(
         x,
         fn_broadcast,
         scale,
@@ -173,8 +173,8 @@ def test_sparkinfer_mhc_pre_broadcast_match_reference(tokens: int) -> None:
 
 
 @pytest.mark.parametrize("tokens", [1, 3, 8])
-def test_sparkinfer_mhc_post_match_reference(tokens: int) -> None:
-    device = require_sparkinfer()
+def test_b12x_mhc_post_match_reference(tokens: int) -> None:
+    device = require_b12x()
     hidden_size = 4096
     residual, x, fn, scale, bias = _make_inputs(
         tokens=tokens,
@@ -193,7 +193,7 @@ def test_sparkinfer_mhc_post_match_reference(tokens: int) -> None:
     )
     out = torch.empty_like(residual)
 
-    residual_cur = sparkinfer_mhc_post(
+    residual_cur = b12x_mhc_post(
         x,
         residual,
         prev_post.contiguous(),
@@ -208,8 +208,8 @@ def test_sparkinfer_mhc_post_match_reference(tokens: int) -> None:
 
 
 @pytest.mark.parametrize("tokens", [1, 3, 8])
-def test_sparkinfer_mhc_fused_post_pre_match_reference(tokens: int) -> None:
-    device = require_sparkinfer()
+def test_b12x_mhc_fused_post_pre_match_reference(tokens: int) -> None:
+    device = require_b12x()
     hidden_size = 4096
     residual, x, fn, scale, bias = _make_inputs(
         tokens=tokens,
@@ -235,7 +235,7 @@ def test_sparkinfer_mhc_fused_post_pre_match_reference(tokens: int) -> None:
     if tokens == 3:
         prev_post_arg = prev_post_arg.unsqueeze(-1).contiguous()
 
-    residual_cur, post, comb, y = sparkinfer_mhc_post_pre(
+    residual_cur, post, comb, y = b12x_mhc_post_pre(
         x,
         residual,
         prev_post_arg,
@@ -273,8 +273,8 @@ def test_sparkinfer_mhc_fused_post_pre_match_reference(tokens: int) -> None:
 
 
 @pytest.mark.parametrize("tokens", [1, 3])
-def test_sparkinfer_mhc_fused_post_pre_with_rmsnorm_match_reference(tokens: int) -> None:
-    device = require_sparkinfer()
+def test_b12x_mhc_fused_post_pre_with_rmsnorm_match_reference(tokens: int) -> None:
+    device = require_b12x()
     hidden_size = 4096
     residual, x, fn, scale, bias = _make_inputs(
         tokens=tokens,
@@ -305,7 +305,7 @@ def test_sparkinfer_mhc_fused_post_pre_with_rmsnorm_match_reference(tokens: int)
         sinkhorn_iters=20,
     )
 
-    residual_cur, post, comb, y = sparkinfer_mhc_post_pre(
+    residual_cur, post, comb, y = b12x_mhc_post_pre(
         x,
         residual,
         prev_post.contiguous(),
@@ -366,29 +366,29 @@ def test_sparkinfer_mhc_fused_post_pre_with_rmsnorm_match_reference(tokens: int)
     ],
     ids=lambda value: str(value),
 )
-def test_sparkinfer_mhc_fused_post_pre_prefill_expected_m_match_reference(
+def test_b12x_mhc_fused_post_pre_prefill_expected_m_match_reference(
     hidden_size: int,
     split_k: int,
     prefill_mode: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    device = require_sparkinfer()
+    device = require_b12x()
     tokens = 33
     expected_m = 384
-    monkeypatch.setenv("SPARKINFER_MHC_PREFILL_TF32_MMA", "0")
-    monkeypatch.setenv("SPARKINFER_MHC_PREFILL_BF16_MMA", "0")
-    monkeypatch.setenv("SPARKINFER_MHC_PREFILL_BLOCK_M", "0")
-    monkeypatch.setenv("SPARKINFER_MHC_PREFILL_COMPACT", "1")
+    monkeypatch.setenv("B12X_MHC_PREFILL_TF32_MMA", "0")
+    monkeypatch.setenv("B12X_MHC_PREFILL_BF16_MMA", "0")
+    monkeypatch.setenv("B12X_MHC_PREFILL_BLOCK_M", "0")
+    monkeypatch.setenv("B12X_MHC_PREFILL_COMPACT", "1")
     if prefill_mode == "block":
-        monkeypatch.setenv("SPARKINFER_MHC_PREFILL_BLOCK_M", "1")
+        monkeypatch.setenv("B12X_MHC_PREFILL_BLOCK_M", "1")
     elif prefill_mode == "bf16_tma":
-        monkeypatch.setenv("SPARKINFER_MHC_PREFILL_BF16_MMA", "1")
-        monkeypatch.setenv("SPARKINFER_MHC_PREFILL_BF16_TMA", "1")
+        monkeypatch.setenv("B12X_MHC_PREFILL_BF16_MMA", "1")
+        monkeypatch.setenv("B12X_MHC_PREFILL_BF16_TMA", "1")
     elif prefill_mode == "bf16_vector":
-        monkeypatch.setenv("SPARKINFER_MHC_PREFILL_BF16_MMA", "1")
-        monkeypatch.setenv("SPARKINFER_MHC_PREFILL_BF16_TMA", "0")
+        monkeypatch.setenv("B12X_MHC_PREFILL_BF16_MMA", "1")
+        monkeypatch.setenv("B12X_MHC_PREFILL_BF16_TMA", "0")
     elif prefill_mode == "tf32_tma":
-        monkeypatch.setenv("SPARKINFER_MHC_PREFILL_TF32_MMA", "1")
+        monkeypatch.setenv("B12X_MHC_PREFILL_TF32_MMA", "1")
     elif prefill_mode != "compact":
         raise AssertionError(f"unknown prefill mode {prefill_mode}")
     residual, x, fn, scale, bias = _make_inputs(
@@ -435,7 +435,7 @@ def test_sparkinfer_mhc_fused_post_pre_prefill_expected_m_match_reference(
     prev_comb_arg = prev_comb.contiguous()
 
     def run() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        return sparkinfer_mhc_post_pre(
+        return b12x_mhc_post_pre(
             x,
             residual,
             prev_post_arg,
@@ -536,8 +536,8 @@ def test_sparkinfer_mhc_fused_post_pre_prefill_expected_m_match_reference(
     torch.testing.assert_close(comb, comb_ref_live, rtol=2e-4, atol=2e-4)
 
 
-def test_sparkinfer_mhc_pro_hidden_match_reference() -> None:
-    device = require_sparkinfer()
+def test_b12x_mhc_pro_hidden_match_reference() -> None:
+    device = require_b12x()
     tokens = 1
     hidden_size = 7168
     split_k = 112
@@ -572,7 +572,7 @@ def test_sparkinfer_mhc_pro_hidden_match_reference() -> None:
     )
 
     residual_post = torch.empty_like(residual)
-    residual_cur = sparkinfer_mhc_post(
+    residual_cur = b12x_mhc_post(
         x,
         residual,
         prev_post.contiguous(),
@@ -582,7 +582,7 @@ def test_sparkinfer_mhc_pro_hidden_match_reference() -> None:
     residual_ref = _mhc_post_reference(x, residual, prev_post, prev_comb)
     torch.testing.assert_close(residual_cur, residual_ref, rtol=0.0, atol=2e-2)
 
-    residual_cur, post, comb, y = sparkinfer_mhc_post_pre(
+    residual_cur, post, comb, y = b12x_mhc_post_pre(
         x,
         residual,
         prev_post.contiguous(),
@@ -620,7 +620,7 @@ def test_sparkinfer_mhc_pro_hidden_match_reference() -> None:
     torch.testing.assert_close(post, post_ref, rtol=2e-6, atol=1e-5)
     torch.testing.assert_close(comb, comb_ref, rtol=2e-6, atol=1e-5)
 
-    residual_func, post_func, comb_func, y_func = sparkinfer_mhc_post_pre(
+    residual_func, post_func, comb_func, y_func = b12x_mhc_post_pre(
         x,
         residual,
         prev_post.contiguous(),
@@ -665,17 +665,17 @@ def test_sparkinfer_mhc_pro_hidden_match_reference() -> None:
         "h7168-pre",
     ],
 )
-def test_sparkinfer_mhc_decode_specialization_live_graph_oracle(
+def test_b12x_mhc_decode_specialization_live_graph_oracle(
     hidden_size: int,
     split_k: int,
     decode_mode: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    device = require_sparkinfer()
+    device = require_b12x()
     monkeypatch.setenv(
-        "SPARKINFER_MHC_DECODE_SPLITS", "4" if decode_mode == "split" else "0"
+        "B12X_MHC_DECODE_SPLITS", "4" if decode_mode == "split" else "0"
     )
-    monkeypatch.setenv("SPARKINFER_MHC_DECODE_TILE_N", "6")
+    monkeypatch.setenv("B12X_MHC_DECODE_TILE_N", "6")
     tokens = 1
     residual, x, fn, scale, bias = _make_inputs(
         tokens=tokens,
@@ -734,7 +734,7 @@ def test_sparkinfer_mhc_decode_specialization_live_graph_oracle(
         out = torch.empty_like(residual)
 
         def run_post() -> torch.Tensor:
-            return sparkinfer_mhc_post(
+            return b12x_mhc_post(
                 x, residual, prev_post, prev_comb, out=out
             )
 
@@ -789,7 +789,7 @@ def test_sparkinfer_mhc_decode_specialization_live_graph_oracle(
         def run_pre() -> tuple[
             torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
         ]:
-            return sparkinfer_mhc_pre(
+            return b12x_mhc_pre(
                 x,
                 pre_fn,
                 scale,
@@ -814,7 +814,7 @@ def test_sparkinfer_mhc_decode_specialization_live_graph_oracle(
         def run_post_pre() -> tuple[
             torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
         ]:
-            return sparkinfer_mhc_post_pre(
+            return b12x_mhc_post_pre(
                 x,
                 residual,
                 prev_post,
@@ -888,8 +888,8 @@ def test_sparkinfer_mhc_decode_specialization_live_graph_oracle(
     )
 
 
-def test_sparkinfer_mhc_fused_post_pre_graph_capture() -> None:
-    device = require_sparkinfer()
+def test_b12x_mhc_fused_post_pre_graph_capture() -> None:
+    device = require_b12x()
     tokens = 2
     hidden_size = 4096
     residual, x, fn, scale, bias = _make_inputs(
@@ -921,7 +921,7 @@ def test_sparkinfer_mhc_fused_post_pre_graph_capture() -> None:
     comb = binding.comb_buffer
 
     def run() -> None:
-        sparkinfer_mhc_post_pre(
+        b12x_mhc_post_pre(
             x,
             residual,
             prev_post_arg,

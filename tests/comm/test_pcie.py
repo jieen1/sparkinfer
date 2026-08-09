@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import torch
 
-from sparkinfer.comm.pcie.pcie_oneshot import (
+from b12x.comm.pcie.pcie_oneshot import (
     PCIeOneshotAllReduce,
     PCIeOneshotAllReducePool,
     parse_pcie_oneshot_max_size,
@@ -103,6 +103,7 @@ def _make_runtime(
     if eager:
         kwargs["eager_buffer_ptrs0"] = tuple(range(200, 200 + world_size))
         kwargs["eager_buffer_ptrs1"] = tuple(range(300, 300 + world_size))
+        kwargs["eager_buffer_bytes"] = max_size
     return PCIeOneshotAllReduce(
         rank=rank,
         world_size=world_size,

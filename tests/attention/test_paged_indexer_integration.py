@@ -3,8 +3,8 @@ from __future__ import annotations
 import pytest
 import torch
 
-from sparkinfer.attention.nsa_indexer._impl import clear_indexer_caches
-from sparkinfer.attention.nsa_indexer.paged import (
+from b12x.attention.nsa_indexer._impl import clear_indexer_caches
+from b12x.attention.nsa_indexer.paged import (
     _paged_indexer_chunk_geometry,
     _plan_two_level_fold,
     index_topk_fp8,
@@ -13,11 +13,11 @@ from sparkinfer.attention.nsa_indexer.paged import (
     prepare_paged_indexer_metadata,
     resolve_replicated_num_q_heads,
 )
-from sparkinfer.attention.nsa_indexer.scratch import (
-    SPARKINFERIndexerPagedScratchCaps,
+from b12x.attention.nsa_indexer.scratch import (
+    B12XIndexerPagedScratchCaps,
     plan_indexer_paged_scratch,
 )
-from sparkinfer.attention.nsa_indexer.tiled_topk import run_tiled_topk
+from b12x.attention.nsa_indexer.tiled_topk import run_tiled_topk
 
 
 def _make_real_page_table(
@@ -135,7 +135,7 @@ def _bind_paged_indexer(
     output_physical_slots: bool = False,
 ):
     plan = plan_indexer_paged_scratch(
-        SPARKINFERIndexerPagedScratchCaps(
+        B12XIndexerPagedScratchCaps(
             device=device,
             num_q_heads=num_heads,
             max_q_rows=rows,
@@ -256,7 +256,7 @@ def test_paged_index_plan_binding_keeps_metadata_aliases() -> None:
 def test_index_topk_fp8_graph_matches_reference(
     monkeypatch,
 ) -> None:
-    monkeypatch.setenv("SPARKINFER_PAGED_INDEX_SUPERTILE_K", "512")
+    monkeypatch.setenv("B12X_PAGED_INDEX_SUPERTILE_K", "512")
 
     device = torch.device("cuda")
     gen = torch.Generator(device="cpu")
@@ -403,7 +403,7 @@ def test_index_topk_fp8_graph_matches_reference(
 def test_paged_tiled_indexer_emits_physical_slots_in_final_fold(
     monkeypatch,
 ) -> None:
-    monkeypatch.setenv("SPARKINFER_PAGED_INDEX_SUPERTILE_K", "512")
+    monkeypatch.setenv("B12X_PAGED_INDEX_SUPERTILE_K", "512")
 
     device = torch.device("cuda")
     gen = torch.Generator(device="cpu").manual_seed(91_009)
@@ -491,10 +491,10 @@ def test_tiled_topk_physical_slots_use_runtime_page_table_row_stride(
     monkeypatch,
 ) -> None:
     """A cached cubin must support both narrow and full-capacity page tables."""
-    from sparkinfer._lib.compiler import clear_compile_cache, compile_cache_info
+    from b12x._lib.compiler import clear_compile_cache, compile_cache_info
 
-    monkeypatch.setenv("SPARKINFER_COMPILE_DISK_CACHE", "0")
-    monkeypatch.setenv("SPARKINFER_COMPILE_MEMORY_CACHE", "1")
+    monkeypatch.setenv("B12X_COMPILE_DISK_CACHE", "0")
+    monkeypatch.setenv("B12X_COMPILE_MEMORY_CACHE", "1")
     clear_compile_cache()
 
     device = torch.device("cuda")
@@ -559,7 +559,7 @@ def test_tiled_topk_physical_slots_use_runtime_page_table_row_stride(
 def test_paged_index_shared_supertile_prefill_graph_matches_reference(
     monkeypatch,
 ) -> None:
-    monkeypatch.setenv("SPARKINFER_PAGED_INDEX_SUPERTILE_K", "4096")
+    monkeypatch.setenv("B12X_PAGED_INDEX_SUPERTILE_K", "4096")
 
     device = torch.device("cuda")
     gen = torch.Generator(device="cpu")
@@ -730,7 +730,7 @@ def test_paged_index_supertile_scratch_sizes_candidate_carry_buffer() -> None:
     assert chunk_count > 2  # this config is genuinely multi-chunk
 
     plan = plan_indexer_paged_scratch(
-        SPARKINFERIndexerPagedScratchCaps(
+        B12XIndexerPagedScratchCaps(
             device=device,
             num_q_heads=64,
             max_q_rows=16,
@@ -765,7 +765,7 @@ def test_paged_index_supertile_scratch_sizes_candidate_carry_buffer() -> None:
 def test_paged_index_supertile_plan_records_launch_contract() -> None:
     device = torch.device("cpu")
     plan = plan_indexer_paged_scratch(
-        SPARKINFERIndexerPagedScratchCaps(
+        B12XIndexerPagedScratchCaps(
             device=device,
             num_q_heads=64,
             max_q_rows=2,
@@ -787,8 +787,8 @@ def test_paged_index_supertile_plan_records_launch_contract() -> None:
 def test_two_level_fold_auto_respects_candidate_memory_boundary(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("SPARKINFER_INDEXER_TWO_LEVEL_FOLD", "auto")
-    monkeypatch.setenv("SPARKINFER_INDEXER_TWO_LEVEL_FOLD_MAX_MIB", "1")
+    monkeypatch.setenv("B12X_INDEXER_TWO_LEVEL_FOLD", "auto")
+    monkeypatch.setenv("B12X_INDEXER_TWO_LEVEL_FOLD_MAX_MIB", "1")
     common = {
         "topk": 512,
         "page_size": 64,
@@ -815,8 +815,8 @@ def test_two_level_fold_auto_respects_candidate_memory_boundary(
 def test_two_level_fold_forced_mode_ignores_memory_boundary(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("SPARKINFER_INDEXER_TWO_LEVEL_FOLD", "on")
-    monkeypatch.setenv("SPARKINFER_INDEXER_TWO_LEVEL_FOLD_MAX_MIB", "0")
+    monkeypatch.setenv("B12X_INDEXER_TWO_LEVEL_FOLD", "on")
+    monkeypatch.setenv("B12X_INDEXER_TWO_LEVEL_FOLD_MAX_MIB", "0")
 
     plan = _plan_two_level_fold(
         q_rows=64,
@@ -862,7 +862,7 @@ def test_two_level_fold_ineligible_routes_use_streaming_carry(
     mode: str,
     reason: str,
 ) -> None:
-    monkeypatch.setenv("SPARKINFER_INDEXER_TWO_LEVEL_FOLD", mode)
+    monkeypatch.setenv("B12X_INDEXER_TWO_LEVEL_FOLD", mode)
 
     plan = _plan_two_level_fold(
         q_rows=16,
@@ -880,9 +880,9 @@ def test_two_level_fold_ineligible_routes_use_streaming_carry(
 @pytest.mark.parametrize(
     ("name", "value"),
     [
-        ("SPARKINFER_INDEXER_TWO_LEVEL_FOLD", "sometimes"),
-        ("SPARKINFER_INDEXER_TWO_LEVEL_FOLD_MAX_MIB", "-1"),
-        ("SPARKINFER_INDEXER_TWO_LEVEL_FOLD_MAX_MIB", "many"),
+        ("B12X_INDEXER_TWO_LEVEL_FOLD", "sometimes"),
+        ("B12X_INDEXER_TWO_LEVEL_FOLD_MAX_MIB", "-1"),
+        ("B12X_INDEXER_TWO_LEVEL_FOLD_MAX_MIB", "many"),
     ],
 )
 def test_two_level_fold_rejects_invalid_policy(
@@ -906,7 +906,7 @@ def test_two_level_fold_rejects_invalid_policy(
 def test_two_level_fold_rejects_invalid_geometry(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("SPARKINFER_INDEXER_TWO_LEVEL_FOLD", "auto")
+    monkeypatch.setenv("B12X_INDEXER_TWO_LEVEL_FOLD", "auto")
 
     with pytest.raises(ValueError, match="q_rows"):
         _plan_two_level_fold(
@@ -982,7 +982,7 @@ def test_paged_index_two_level_fold_clips_rounded_final_slice() -> None:
 def test_index_topk_fp8_graph_unaligned_single_chunk(
     monkeypatch,
 ) -> None:
-    monkeypatch.setenv("SPARKINFER_PAGED_INDEX_SUPERTILE_K", "1536")
+    monkeypatch.setenv("B12X_PAGED_INDEX_SUPERTILE_K", "1536")
 
     device = torch.device("cuda")
     gen = torch.Generator(device="cpu")

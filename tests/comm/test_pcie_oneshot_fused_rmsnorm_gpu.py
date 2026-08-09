@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import ctypes
 import os
 import socket
+import time
+from datetime import timedelta
 
 import pytest
 import torch
@@ -9,15 +12,18 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 from cuda.bindings import runtime as cudart
 
-from sparkinfer.comm.pcie.pcie_oneshot import PCIeOneshotAllReducePool
+from b12x.comm.pcie.pcie_oneshot import PCIeOneshotAllReducePool
 
 
 pytestmark = pytest.mark.skipif(
-    os.getenv("SPARKINFER_RUN_PCIE_ONESHOT_RMS_TEST") != "1",
+    os.getenv("B12X_RUN_PCIE_ONESHOT_RMS_TEST") != "1",
     reason=(
-        "set SPARKINFER_RUN_PCIE_ONESHOT_RMS_TEST=1 to run PCIe oneshot fused "
+        "set B12X_RUN_PCIE_ONESHOT_RMS_TEST=1 to run PCIe oneshot fused "
         "RMSNorm GPU tests"
     ),
+)
+TEST_TIMEOUT_SECONDS = float(
+    os.getenv("B12X_PCIE_ONESHOT_RMS_TIMEOUT_SECONDS", "300")
 )
 
 
@@ -71,7 +77,30 @@ def _assert_close(
         torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
 
 
-def _cuda_graph_kernel_count(graph: torch.cuda.CUDAGraph) -> int:
+def _local_eager_words(
+    channel, stream: torch.cuda.Stream, *, offset: int = 0
+) -> tuple[int, int]:
+    assert channel._ipc is not None
+    assert channel._eager_ptrs is not None
+    words = (ctypes.c_uint64(), ctypes.c_uint64())
+    for word, slot_ptrs in zip(words, channel._eager_ptrs, strict=True):
+        channel._ipc.cudaMemcpyAsync(
+            ctypes.addressof(word),
+            slot_ptrs[channel.rank] + offset,
+            ctypes.sizeof(word),
+            int(stream.cuda_stream),
+        )
+    stream.synchronize()
+    return words[0].value, words[1].value
+
+
+def _dim3_tuple(value) -> tuple[int, int, int]:
+    return int(value.x), int(value.y), int(value.z)
+
+
+def _cuda_graph_kernel_chain(
+    graph: torch.cuda.CUDAGraph,
+) -> tuple[tuple[int, int, int], tuple[int, int, int]]:
     graph_handle = graph.raw_cuda_graph()
     result, _, num_nodes = cudart.cudaGraphGetNodes(graph_handle)
     assert result == cudart.cudaError_t.cudaSuccess
@@ -82,12 +111,32 @@ def _cuda_graph_kernel_count(graph: torch.cuda.CUDAGraph) -> int:
     assert result == cudart.cudaError_t.cudaSuccess
     assert returned_nodes == num_nodes
     kernel_type = cudart.cudaGraphNodeType.cudaGraphNodeTypeKernel
-    kernel_count = 0
+    kernel_nodes = []
     for node in nodes[:num_nodes]:
         result, node_type = cudart.cudaGraphNodeGetType(node)
         assert result == cudart.cudaError_t.cudaSuccess
-        kernel_count += node_type == kernel_type
-    return kernel_count
+        if node_type == kernel_type:
+            kernel_nodes.append(node)
+    assert len(kernel_nodes) == 1, (
+        "CuTe staged fused capture must fold device slot selection into its "
+        f"worker, found {len(kernel_nodes)} kernel nodes"
+    )
+
+    def geometry(node) -> tuple[tuple[int, int, int], tuple[int, int, int]]:
+        result, params = cudart.cudaGraphKernelNodeGetParams(node)
+        if result != cudart.cudaError_t.cudaSuccess and hasattr(
+            cudart, "cudaGraphNodeGetParams"
+        ):
+            fallback_result, node_params = cudart.cudaGraphNodeGetParams(node)
+            assert fallback_result == cudart.cudaError_t.cudaSuccess
+            result, params = fallback_result, node_params.kernel
+        assert result == cudart.cudaError_t.cudaSuccess
+        return _dim3_tuple(params.gridDim), _dim3_tuple(params.blockDim)
+
+    worker = geometry(kernel_nodes[0])
+    assert worker[0][0] > 1
+    assert worker[1][0] >= 64
+    return worker
 
 
 def _run_eager(
@@ -124,12 +173,20 @@ def _run_eager(
                 epsilon,
             )
             torch.cuda.synchronize(device)
+            wrong_device = (rank + 1) % dist.get_world_size()
+            exercise_device_guard = dtype == torch.float16 and rows == 1 and hidden_size == 6144
+            if exercise_device_guard:
+                torch.cuda.set_device(wrong_device)
             out, residual_out = pool.all_reduce_fused_add_rms_norm(
                 inp,
                 residual,
                 weight,
                 epsilon,
+                channel_id="eager:fused-rmsnorm",
             )
+            if exercise_device_guard:
+                assert torch.cuda.current_device() == wrong_device
+                torch.cuda.set_device(rank)
             torch.cuda.synchronize(device)
             _assert_close(out, expected_out, dtype)
             _assert_close(residual_out, expected_residual, dtype)
@@ -152,10 +209,11 @@ def _run_graph(
         rank,
     )
     out = torch.empty_like(inp)
-    pool.for_stream()
-
     graph = torch.cuda.CUDAGraph(keep_graph=True)
-    with pool.capture(), torch.cuda.graph(graph):
+    with (
+        pool.capture(channel_id="graph:fused-rmsnorm") as channel,
+        torch.cuda.graph(graph),
+    ):
         pool.all_reduce_fused_add_rms_norm(
             inp,
             residual,
@@ -163,8 +221,17 @@ def _run_graph(
             epsilon,
             out=out,
             residual_out=residual,
+            channel_id="graph:fused-rmsnorm",
         )
-    assert _cuda_graph_kernel_count(graph) == 1
+    # CuTe folds device-side slot selection into the worker, so staged capture
+    # preserves the one-kernel production topology.
+    _cuda_graph_kernel_chain(graph)
+    stream = torch.cuda.current_stream(device)
+    offset = 0
+    if os.getenv("B12X_PCIE_ONESHOT_PUSH", "0") not in ("", "0"):
+        remote_source = (rank + 1) % dist.get_world_size()
+        offset = remote_source * inp.numel() * inp.element_size()
+    snapshots = [_local_eager_words(channel, stream, offset=offset)]
 
     for iteration in range(3):
         next_inp, next_residual, _ = _make_inputs(
@@ -187,6 +254,23 @@ def _run_graph(
         torch.cuda.synchronize(device)
         _assert_close(out, expected_out, dtype)
         _assert_close(residual, expected_residual, dtype)
+        snapshots.append(_local_eager_words(channel, stream, offset=offset))
+
+    changed_slots = [
+        {
+            slot
+            for slot, (before, after) in enumerate(
+                zip(snapshots[index], snapshots[index + 1], strict=True)
+            )
+            if before != after
+        }
+        for index in range(3)
+    ]
+    assert all(len(changed) == 1 for changed in changed_slots)
+    assert all(
+        changed_slots[index] != changed_slots[index + 1]
+        for index in range(len(changed_slots) - 1)
+    )
 
 
 def _worker(rank: int, world_size: int, port: int) -> None:
@@ -197,14 +281,18 @@ def _worker(rank: int, world_size: int, port: int) -> None:
         init_method=f"tcp://127.0.0.1:{port}",
         rank=rank,
         world_size=world_size,
+        timeout=timedelta(seconds=TEST_TIMEOUT_SECONDS),
     )
     pool = PCIeOneshotAllReducePool.from_process_group(
         process_group=dist.group.WORLD,
         device=device,
         max_input_bytes=128 * 1024,
         max_size=128 * 1024,
+        max_concurrent_channels=2,
     )
     try:
+        pool.prepare_channels(("eager:fused-rmsnorm", "graph:fused-rmsnorm"))
+        pool.for_stream(channel_id="eager:fused-rmsnorm")
         _run_eager(pool, device, rank)
         dist.barrier()
         _run_graph(pool, device, rank)
@@ -217,11 +305,34 @@ def _worker(rank: int, world_size: int, port: int) -> None:
 def test_pcie_oneshot_fused_add_rms_norm_eager_and_graph() -> None:
     if not torch.cuda.is_available():
         pytest.skip("CUDA is not available")
-    world_size = int(os.getenv("SPARKINFER_PCIE_ONESHOT_RMS_WORLD_SIZE", "2"))
+    world_size = int(os.getenv("B12X_PCIE_ONESHOT_RMS_WORLD_SIZE", "2"))
     if world_size not in (2, 4, 6, 8, 10):
         pytest.skip("PCIe oneshot only supports world sizes 2, 4, 6, 8, and 10")
     if torch.cuda.device_count() < world_size:
         pytest.skip(
             f"need {world_size} CUDA devices, found {torch.cuda.device_count()}"
         )
-    mp.spawn(_worker, args=(world_size, _free_port()), nprocs=world_size, join=True)
+    context = mp.spawn(
+        _worker,
+        args=(world_size, _free_port()),
+        nprocs=world_size,
+        join=False,
+    )
+    deadline = time.monotonic() + TEST_TIMEOUT_SECONDS
+    while time.monotonic() < deadline:
+        remaining = deadline - time.monotonic()
+        if context.join(timeout=min(1.0, remaining), grace_period=5):
+            return
+    for process in context.processes:
+        if process.is_alive():
+            process.terminate()
+    for process in context.processes:
+        process.join(timeout=5)
+    for process in context.processes:
+        if process.is_alive():
+            process.kill()
+        process.join()
+    pytest.fail(
+        "PCIe oneshot fused RMSNorm test exceeded "
+        f"{TEST_TIMEOUT_SECONDS:.0f}s; probable collective deadlock"
+    )

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 try:
@@ -9,21 +10,19 @@ except ModuleNotFoundError:  # Python 3.10
 
 
 ROOT = Path(__file__).parents[1]
-PCIE_PACKAGE = "sparkinfer.comm.pcie"
-RUNTIME_CUDA_SOURCES = {
-    "pcie_dcp_a2a.cu",
-    "pcie_dcp_topk.cu",
-    "pcie_dma.cu",
-    "pcie_oneshot.cu",
-    "pcie_twoshot.cu",
-}
+PCIE_SOURCE = ROOT / "b12x" / "comm" / "pcie"
 
 
-def test_runtime_cuda_sources_are_in_package_data() -> None:
+def test_pcie_collectives_are_python_only() -> None:
     config = tomllib.loads((ROOT / "pyproject.toml").read_text())
-    package_data = config["tool"]["setuptools"]["package-data"]
+    package_data = config["tool"]["setuptools"].get("package-data", {})
 
-    assert package_data[PCIE_PACKAGE] == ["*.cu"]
-    assert {
-        path.name for path in (ROOT / "sparkinfer" / "comm" / "pcie").glob("*.cu")
-    } == RUNTIME_CUDA_SOURCES
+    assert "b12x.comm.pcie" not in package_data
+    assert not list(PCIE_SOURCE.glob("*.cu"))
+    assert not list(PCIE_SOURCE.glob("*.cuh"))
+    assert not list(PCIE_SOURCE.glob("*.cpp"))
+    for source in PCIE_SOURCE.glob("*.py"):
+        text = source.read_text()
+        assert "torch.utils.cpp_extension" not in text
+        assert "cpp_extension.load" not in text
+        assert "load_inline(" not in text
