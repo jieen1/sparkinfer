@@ -630,6 +630,7 @@ class DenseGemmKernel:
         mxfp6_fmt_b: Optional[str] = None,
         b_packed: bool = False,
         plain_fp8: bool = False,
+        fused_quant_bf16: Optional[bool] = None,
         plain_fp8_alpha_col: bool = False,
         block_fp8: bool = False,
     ):
@@ -7134,6 +7135,7 @@ def dense_gemm(
     b_fmt: Optional[str] = None,
     x_bf16: Optional[torch.Tensor] = None,
     w_gscale: Optional[torch.Tensor] = None,
+    row_scale: Optional[torch.Tensor] = None,
     plain_fp8: bool = False,
     alpha_col: Optional[torch.Tensor] = None,
     block_fp8: bool = False,
