@@ -11,7 +11,7 @@ import importlib.metadata
 import importlib.util
 import re
 
-MIN_CUTLASS_DSL = "4.6.0"
+MIN_CUTLASS_DSL = "4.7.0"
 
 
 def get_compute_capability(device=None) -> tuple[int, int] | None:
