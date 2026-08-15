@@ -2803,17 +2803,22 @@ def _literal_update_mdo_states_fp32_pack_p_row0(
         m_new = attention_ops.fmax(m_new, cute.arch.shuffle_sync_bfly(m_new, offset=2))
         m_new = attention_ops.fmax(m_new, cute.arch.shuffle_sync_bfly(m_new, offset=1))
 
-        scale_term = (
-            Float32(1.0)
-            if m_new == -Float32.inf
-            else _exp2_approx_ftz_f32((m_prev - m_new) * sm_scale_log2)
-        )
-        d_frag[mma_q, 0] = Float32(d_frag[mma_q, 0] * scale_term)
-        for mma_d in cutlass.range_constexpr(num_mma_d_vo):
-            o_frag[mma_q, mma_d, 0] *= scale_term
-            o_frag[mma_q, mma_d, 1] *= scale_term
-            o_frag[mma_q, mma_d, 4] *= scale_term
-            o_frag[mma_q, mma_d, 5] *= scale_term
+        # Exact conditional rescale (FA4 transfer, qwen-sm120-runtime plan
+        # P0-A1): the fmax chain guarantees m_new >= m_prev, and when the
+        # two are equal the rescale factor is exactly 1.0 -- including the
+        # both-(-inf) case, which the old code special-cased to 1.0.  IEEE
+        # x*1.0 is bit-identical to x, so skipping the d/o multiply is
+        # bit-exact.  Long-context decode reaches a stable row max after the
+        # first chunks, so this skips the exp2 and the rescale multiplies on
+        # most KV chunks.
+        if m_new != m_prev:
+            scale_term = _exp2_approx_ftz_f32((m_prev - m_new) * sm_scale_log2)
+            d_frag[mma_q, 0] = Float32(d_frag[mma_q, 0] * scale_term)
+            for mma_d in cutlass.range_constexpr(num_mma_d_vo):
+                o_frag[mma_q, mma_d, 0] *= scale_term
+                o_frag[mma_q, mma_d, 1] *= scale_term
+                o_frag[mma_q, mma_d, 4] *= scale_term
+                o_frag[mma_q, mma_d, 5] *= scale_term
 
         for mma_kv in cutlass.range_constexpr(num_mma_kv):
             p0 = (
@@ -2871,17 +2876,17 @@ def _literal_update_mdo_states_fp32_pack_p_row0_1x1(
     m_new = attention_ops.fmax(m_new, cute.arch.shuffle_sync_bfly(m_new, offset=2))
     m_new = attention_ops.fmax(m_new, cute.arch.shuffle_sync_bfly(m_new, offset=1))
 
-    scale_term = (
-        Float32(1.0)
-        if m_new == -Float32.inf
-        else _exp2_approx_ftz_f32((m_prev - m_new) * sm_scale_log2)
-    )
-    d_frag[0, 0] = Float32(d_frag[0, 0] * scale_term)
-    for mma_d in cutlass.range_constexpr(num_mma_d_vo):
-        o_frag[0, mma_d, 0] *= scale_term
-        o_frag[0, mma_d, 1] *= scale_term
-        o_frag[0, mma_d, 4] *= scale_term
-        o_frag[0, mma_d, 5] *= scale_term
+    # Exact conditional rescale -- see _literal_update_mdo_states_fp32_pack_p_row0
+    # for the bit-exactness derivation (m_new >= m_prev; equality means the
+    # factor is exactly 1.0, and IEEE x*1.0 == x).
+    if m_new != m_prev:
+        scale_term = _exp2_approx_ftz_f32((m_prev - m_new) * sm_scale_log2)
+        d_frag[0, 0] = Float32(d_frag[0, 0] * scale_term)
+        for mma_d in cutlass.range_constexpr(num_mma_d_vo):
+            o_frag[0, mma_d, 0] *= scale_term
+            o_frag[0, mma_d, 1] *= scale_term
+            o_frag[0, mma_d, 4] *= scale_term
+            o_frag[0, mma_d, 5] *= scale_term
 
     p0 = (
         Float32(0.0)
