@@ -23,7 +23,6 @@ META = OpMeta(
         "prepare_weight",
         "prepare_pair_weight",
         "run",
-        "run_w4a8",
         "is_supported",
         "clear_caches",
     ),
@@ -56,7 +55,6 @@ if TYPE_CHECKING:
         prepare_weight,
         prepare_pair_weight,
         run,
-        run_w4a8,
     )
 
 install_lazy_api(globals(), META)

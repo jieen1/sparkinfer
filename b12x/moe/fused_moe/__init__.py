@@ -4,7 +4,7 @@ scatter, in one launch family.
 Recipes (``META.recipes``) are arguments, not separate ops: nvfp4, mxfp4,
 w4a8_mx, w4a8_nvfp4, w4a16 (weight layouts packed/modelopt and the
 legacy ``exl3_trellis_mcg`` or TP-independent ``qsrt_sqg_e4m3``
-full-rotation sources).
+full-rotation sources, plus uniform-K5/K6 ``sqg_fp16_d3l`` W4A16).
 Activations: silu, situ, relu2,
 swigluoai_uninterleave. Kernel
 regimes (micro / dynamic / tiny-decode / w4a16) are selected declaratively by
@@ -82,6 +82,7 @@ META = OpMeta(
         "w4a16",
         "w4a16/exl3_trellis_mcg",
         "w4a16/qsrt_sqg_e4m3",
+        "w4a16/sqg_fp16_d3l",
     ),
     requires=("triton",),
     provenance=Provenance(

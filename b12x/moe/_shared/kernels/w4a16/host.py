@@ -353,6 +353,26 @@ def make_w4a16_packed_buffers(
         dtype=torch.float32,
         device=device,
     )
+    rotation_a_gate = (
+        torch.empty(
+            (plan.routed_rows, int(prepared.hidden_size)),
+            dtype=torch.float16,
+            device=device,
+        )
+        if full_rotation
+        else None
+    )
+    rotation_a_up = (
+        rotation_a_gate
+        if full_rotation and bool(getattr(prepared, "coupled_hadamard", False))
+        else torch.empty(
+            (plan.routed_rows, int(prepared.hidden_size)),
+            dtype=torch.float16,
+            device=device,
+        )
+        if full_rotation
+        else None
+    )
     return W4A16PackedBuffers(
         intermediate_cache13=torch.empty(
             (plan.intermediate_cache13_elements,),
@@ -384,24 +404,8 @@ def make_w4a16_packed_buffers(
         expert_counts=torch.empty(
             (route_num_experts,), dtype=torch.int32, device=device
         ),
-        rotation_a_gate=(
-            torch.empty(
-                (plan.routed_rows, int(prepared.hidden_size)),
-                dtype=torch.float16,
-                device=device,
-            )
-            if full_rotation
-            else None
-        ),
-        rotation_a_up=(
-            torch.empty(
-                (plan.routed_rows, int(prepared.hidden_size)),
-                dtype=torch.float16,
-                device=device,
-            )
-            if full_rotation
-            else None
-        ),
+        rotation_a_gate=rotation_a_gate,
+        rotation_a_up=rotation_a_up,
     )
 
 

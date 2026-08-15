@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from functools import lru_cache
 from types import SimpleNamespace
 
@@ -16,16 +17,28 @@ from b12x.moe._shared.kernels.w4a16.host import make_w4a16_packed_buffers
 from b12x.moe._shared.kernels.w4a16.kernel import run_w4a16_moe
 from b12x.moe._shared.kernels.w4a16.prepare import (
     PreparedW4A16MoeWeights,
+    _prepare_qsrt_coupled_h308_atom_v2_moe_weights,
+    _prepare_qsrt_p22_atom_v2_moe_weights,
+    _prepare_qsrt_p33_p43_moe_weights,
     prepare_qsrt_atom_moe_weights,
     prepare_qsrt_pair_moe_weights,
+    prepare_trellis256_moe_weights,
 )
 from b12x._lib.quant.sqg_e4m3 import (
     sqg_xor_cheb_t12_direct_lut_cpu,
 )
+from b12x._lib.quant.sqg_fp16_d3l import sqg_fp16_d3l_direct_lut_cpu
 
 _MCG = np.uint64(0xCBAC1FED)
 _MCG_MASK = np.uint32(0x8FFF8FFF)
 _MCG_OR = np.uint32(0x3B603B60)
+
+
+def _sm12x_available() -> bool:
+    if not torch.cuda.is_available():
+        return False
+    major, minor = torch.cuda.get_device_capability(torch.cuda.current_device())
+    return major == 12 and minor in (0, 1)
 
 
 def _weight_plan(
@@ -38,6 +51,8 @@ def _weight_plan(
     trellis_bits: int = 3,
     tile_config: tuple[int, int, int, int] = (64, 256, 64, 256),
     storage_format: str | None = None,
+    qsrt_profile: str | None = None,
+    coupled_hadamard: bool | None = None,
     source_format: str = "exl3_trellis_mcg",
 ) -> fused_moe.WeightsPlan:
     return fused_moe.plan_weights(
@@ -52,6 +67,8 @@ def _weight_plan(
         trellis_bits=trellis_bits,
         trellis_tile_config=tile_config,
         qsrt_storage_format=storage_format,
+        qsrt_profile=qsrt_profile,
+        coupled_hadamard=coupled_hadamard,
     )
 
 
@@ -135,6 +152,117 @@ def test_qsrt_atom_plan_is_explicit_and_fail_closed() -> None:
             trellis_bits=4,
             source_format="qsrt_sqg_e4m3",
             storage_format="qsrt_atoms_v1",
+        )
+
+    v2_plan = _weight_plan(
+        num_experts=896,
+        hidden_size=3584,
+        intermediate_size=256,
+        input_dtype=torch.float16,
+        source_format="qsrt_sqg_e4m3",
+        storage_format="qsrt_atoms_v2",
+    )
+    assert v2_plan.qsrt_storage_format == "qsrt_atoms_v2"
+
+
+def test_qsrt_coupled_k2_atom_plan_freezes_p22_geometry() -> None:
+    plan = _weight_plan(
+        num_experts=896,
+        hidden_size=3584,
+        intermediate_size=384,
+        input_dtype=torch.float16,
+        source_format="qsrt_sqg_e4m3",
+        storage_format="qsrt_atoms_v2",
+        qsrt_profile="k2_coupled_h512_h128",
+        trellis_bits=2,
+        tile_config=(128, 128, 128, 128),
+    )
+    assert plan.qsrt_profile == "k2_coupled_h512_h128"
+    assert plan.trellis_bits == 2
+    assert plan.trellis_tile_config == (128, 128, 128, 128)
+    assert plan.coupled_hadamard
+
+    with pytest.raises(ValueError, match="requires trellis_bits=2"):
+        _weight_plan(
+            num_experts=896,
+            hidden_size=3584,
+            intermediate_size=384,
+            input_dtype=torch.float16,
+            source_format="qsrt_sqg_e4m3",
+            storage_format="qsrt_atoms_v2",
+            qsrt_profile="k2_coupled_h512_h128",
+            trellis_bits=3,
+            tile_config=(128, 128, 128, 128),
+        )
+
+    with pytest.raises(ValueError, match=r"tile_config=\(128, 128, 128, 128\)"):
+        _weight_plan(
+            num_experts=896,
+            hidden_size=3584,
+            intermediate_size=384,
+            input_dtype=torch.float16,
+            source_format="qsrt_sqg_e4m3",
+            storage_format="qsrt_atoms_v2",
+            qsrt_profile="k2_coupled_h512_h128",
+            trellis_bits=2,
+            tile_config=(64, 128, 64, 128),
+        )
+
+
+def test_qsrt_coupled_h308_atom_plan_freezes_geometry() -> None:
+    plan = _weight_plan(
+        num_experts=896,
+        hidden_size=3584,
+        intermediate_size=256,
+        input_dtype=torch.float16,
+        source_format="qsrt_sqg_e4m3",
+        storage_format="qsrt_atoms_v2",
+        qsrt_profile="k3x22_k4x2_coupled_h512_h128",
+        trellis_bits=3,
+        tile_config=(64, 256, 64, 256),
+    )
+    assert plan.qsrt_profile == "k3x22_k4x2_coupled_h512_h128"
+    assert plan.trellis_bits == 3
+    assert plan.trellis_tile_config == (64, 256, 64, 256)
+    assert plan.coupled_hadamard
+
+    with pytest.raises(ValueError, match="requires trellis_bits=3"):
+        _weight_plan(
+            num_experts=896,
+            hidden_size=3584,
+            intermediate_size=256,
+            input_dtype=torch.float16,
+            source_format="qsrt_sqg_e4m3",
+            storage_format="qsrt_atoms_v2",
+            qsrt_profile="k3x22_k4x2_coupled_h512_h128",
+            trellis_bits=2,
+            tile_config=(64, 256, 64, 256),
+        )
+
+    with pytest.raises(ValueError, match="coupled_hadamard flag must agree"):
+        _weight_plan(
+            num_experts=896,
+            hidden_size=3584,
+            intermediate_size=256,
+            input_dtype=torch.float16,
+            source_format="qsrt_sqg_e4m3",
+            storage_format="qsrt_atoms_v2",
+            qsrt_profile="k3x22_k4x2_coupled_h512_h128",
+            trellis_bits=3,
+            tile_config=(64, 256, 64, 256),
+            coupled_hadamard=False,
+        )
+
+
+def test_qsrt_storage_format_is_fail_closed() -> None:
+    with pytest.raises(ValueError, match="qsrt_storage_format"):
+        _weight_plan(
+            num_experts=2,
+            hidden_size=256,
+            intermediate_size=256,
+            input_dtype=torch.float16,
+            source_format="qsrt_sqg_e4m3",
+            storage_format="not_a_qsrt_format",
         )
 
 
@@ -388,6 +516,11 @@ def _sqg_xor_cheb_t12_table(bits: int) -> np.ndarray:
     return rate_labels.view(torch.float8_e4m3fn).to(torch.float16).numpy()
 
 
+@lru_cache(maxsize=None)
+def _sqg_fp16_d3l_table(bits: int) -> np.ndarray:
+    return sqg_fp16_d3l_direct_lut_cpu(bits).numpy()
+
+
 def _decode_mcg_fp16(window: np.ndarray) -> np.ndarray:
     value = window.astype(np.uint64)
     value = ((value * _MCG) & np.uint64(0xFFFFFFFF)).astype(np.uint32)
@@ -408,7 +541,7 @@ def _decode_lane(
     *,
     codebook: str = "mcg",
 ) -> np.ndarray:
-    if codebook not in {"mcg", "sqg_xor_cheb_t12"}:
+    if codebook not in {"mcg", "sqg_xor_cheb_t12", "sqg_fp16_d3l"}:
         raise ValueError(f"unsupported test codebook {codebook!r}")
     width = 8 * bits
     values = []
@@ -424,8 +557,10 @@ def _decode_lane(
         window = ((merged >> np.uint64(shift)) & np.uint64(0xFFFF)).astype(np.uint32)
         if codebook == "mcg":
             values.append(_decode_mcg_fp16(window))
-        else:
+        elif codebook == "sqg_xor_cheb_t12":
             values.append(_sqg_xor_cheb_t12_table(bits)[window])
+        else:
+            values.append(_sqg_fp16_d3l_table(bits)[window])
     return np.stack(values, axis=-1).astype(np.float16)
 
 
@@ -473,6 +608,139 @@ def _reconstruct_native(
     return torch.from_numpy(output)
 
 
+@pytest.mark.skipif(not _sm12x_available(), reason="requires an SM120/SM121 GPU")
+@pytest.mark.parametrize("bits", [5, 6])
+def test_sqg_fp16_d3l_uniform_w4a16_matches_reference_and_captures(
+    bits: int,
+) -> None:
+    """Close native K5/K6 payloads through the actual A16 fused kernel."""
+
+    torch.manual_seed(20260808 + bits)
+    device = torch.device("cuda", torch.cuda.current_device())
+    experts = topk = 1
+    m = 2
+    hidden = intermediate = 128
+    w13 = torch.randint(
+        -32768,
+        32767,
+        (2, experts, hidden // 16, intermediate // 16, 16 * bits),
+        dtype=torch.int16,
+        device=device,
+    )
+    w2 = torch.randint(
+        -32768,
+        32767,
+        (experts, intermediate // 16, hidden // 16, 16 * bits),
+        dtype=torch.int16,
+        device=device,
+    )
+
+    def scales(shape: tuple[int, ...]) -> torch.Tensor:
+        return (0.875 + 0.25 * torch.rand(shape, device=device)).to(torch.float16)
+
+    gate_suh = scales((experts, hidden)).contiguous()
+    up_suh = scales((experts, hidden)).contiguous()
+    intermediate_rotations = scales((experts, 3 * intermediate)).contiguous()
+    down_svh = scales((experts, hidden)).contiguous()
+    prepared = prepare_trellis256_moe_weights(
+        w13,
+        w2,
+        hidden_size=hidden,
+        intermediate_size=intermediate,
+        num_experts=experts,
+        activation="silu",
+        fc1_tile_n=128,
+        fc2_tile_n=128,
+        params_dtype=torch.float16,
+        w13_layout="trellis3_t256_proj",
+        trellis_bits=bits,
+        codebook="sqg_fp16_d3l",
+        gate_suh=gate_suh,
+        up_suh=up_suh,
+        intermediate_rotations=intermediate_rotations,
+        down_svh=down_svh,
+        tile_config=(64, 128, 64, 128),
+    )
+    assert prepared.source_format == "sqg_fp16_d3l"
+    assert prepared.trellis_codebook == "sqg_fp16_d3l"
+
+    gate_weights = _reconstruct_native(
+        w13[0, 0], codebook="sqg_fp16_d3l"
+    ).unsqueeze(0).to(device)
+    up_weights = _reconstruct_native(
+        w13[1, 0], codebook="sqg_fp16_d3l"
+    ).unsqueeze(0).to(device)
+    down_weights = _reconstruct_native(
+        w2[0], codebook="sqg_fp16_d3l"
+    ).unsqueeze(0).to(device)
+    x = (torch.randn((m, hidden), device=device) * 1.0e-3).to(torch.bfloat16)
+    ids = torch.zeros((m, topk), dtype=torch.int32, device=device)
+    router_weights = torch.ones((m, topk), dtype=torch.float32, device=device)
+    buffers = make_w4a16_packed_buffers(
+        prepared,
+        m=m,
+        topk=topk,
+        dtype=torch.float16,
+        device=device,
+        full_rotation=True,
+        block_size_m=8,
+    )
+
+    def run() -> torch.Tensor:
+        return run_w4a16_moe(
+            x,
+            prepared,
+            router_weights,
+            ids,
+            activation="silu",
+            intermediate_cache13=buffers.intermediate_cache13,
+            intermediate_cache2=buffers.intermediate_cache2,
+            output=buffers.output,
+            fc1_c_tmp=buffers.fc1_c_tmp,
+            fc2_c_tmp=buffers.fc2_c_tmp,
+            packed_route_indices=buffers.packed_route_indices,
+            block_expert_ids=buffers.block_expert_ids,
+            packed_route_count=buffers.packed_route_count,
+            expert_offsets=buffers.expert_offsets,
+            expert_counts=buffers.expert_counts,
+            route_block_size_m=8,
+            intermediate_rotation_scales=intermediate_rotations,
+            full_rotation=True,
+            suh_gate_table=gate_suh,
+            suh_up_table=up_suh,
+            svh_table=down_svh,
+            rotation_a_gate=buffers.rotation_a_gate,
+            rotation_a_up=buffers.rotation_a_up,
+        )
+
+    actual = run().clone()
+    torch.cuda.synchronize(device)
+    reference = _reference_full_rotation_decoded(
+        x,
+        ids,
+        router_weights,
+        gate_weights,
+        up_weights,
+        down_weights,
+        gate_suh,
+        up_suh,
+        intermediate_rotations,
+        down_svh,
+    )
+    relative_error = (actual - reference).norm() / reference.norm().clamp_min(1.0e-9)
+    cosine = torch.nn.functional.cosine_similarity(
+        actual.flatten(), reference.flatten(), dim=0
+    )
+    assert float(relative_error) <= 2.0e-2
+    assert float(cosine) >= 0.999
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = run()
+    graph.replay()
+    torch.cuda.synchronize(device)
+    assert torch.equal(captured, actual)
+
 def _hadamard_128(device: torch.device) -> torch.Tensor:
     indices = torch.arange(128, dtype=torch.int64)
     rows = []
@@ -501,6 +769,26 @@ def _had128(
     if svh is not None:
         work = work * svh.float()
     return work.to(torch.float16) if store_fp16 else work
+
+
+def _coupled_h512(value: torch.Tensor, hadamard: torch.Tensor) -> torch.Tensor:
+    """Apply the normalized H512 used at the coupled residual boundary."""
+
+    work = value.float()
+    rows, width = work.shape
+    work = work.view(rows, width // 512, 4, 128) @ hadamard
+    h4 = torch.tensor(
+        (
+            (1.0, 1.0, 1.0, 1.0),
+            (1.0, -1.0, 1.0, -1.0),
+            (1.0, 1.0, -1.0, -1.0),
+            (1.0, -1.0, -1.0, 1.0),
+        ),
+        dtype=torch.float32,
+        device=value.device,
+    ) * 0.5
+    work = torch.einsum("rbgc,gh->rbhc", work, h4)
+    return work.reshape(rows, width)
 
 
 def _reference_full_rotation(
@@ -628,11 +916,883 @@ def _reference_full_rotation_decoded(
     return output
 
 
-def _sm12x_available() -> bool:
-    if not torch.cuda.is_available():
-        return False
-    major, minor = torch.cuda.get_device_capability(torch.cuda.current_device())
-    return major == 12 and minor in (0, 1)
+def _reference_coupled_decoded(
+    x: torch.Tensor,
+    local_ids: torch.Tensor,
+    router_weights: torch.Tensor,
+    slot0_weights: torch.Tensor,
+    slot1_weights: torch.Tensor,
+    down_weights: torch.Tensor,
+    source_suh: torch.Tensor,
+    ordinary_rotations: torch.Tensor,
+    coupled_signs: torch.Tensor,
+    down_svh: torch.Tensor,
+    *,
+    fc1_pair_kind: str | None = None,
+    quantize_activations: bool = False,
+) -> torch.Tensor:
+    """Reference the exact transform order of a coupled uniform-rate path."""
+
+    device = x.device
+    experts = int(down_weights.shape[0])
+    intermediate = int(down_weights.shape[1])
+    hidden = int(down_weights.shape[2])
+    hadamard = _hadamard_128(device)
+    slot0_svh = ordinary_rotations[:, :intermediate]
+    slot1_svh = ordinary_rotations[:, intermediate : 2 * intermediate]
+    down_suh = ordinary_rotations[:, 2 * intermediate :]
+    pre_signs = coupled_signs[:, : 2 * intermediate]
+    post_signs = coupled_signs[:, 2 * intermediate :]
+    output = torch.zeros((int(x.shape[0]), hidden), dtype=torch.float32, device=device)
+
+    for token in range(int(x.shape[0])):
+        route_values: list[torch.Tensor] = []
+        for slot in range(int(local_ids.shape[1])):
+            expert = int(local_ids[token, slot])
+            h_side_expert = 0 if int(source_suh.shape[0]) == 1 else expert
+            source = _coupled_h512(x[token : token + 1].to(torch.float16), hadamard)
+            if quantize_activations:
+                source = _had128(
+                    source * source_suh[h_side_expert].float(),
+                    hadamard,
+                    store_fp16=False,
+                )
+                source = _reference_mxfp8_rows(source)
+            else:
+                source = (source * source_suh[h_side_expert].float()).to(
+                    torch.float16
+                )
+                source = _had128(source, hadamard, store_fp16=True)
+
+            atoms = intermediate // 32
+            physical = [
+                (source.float() @ weights[expert].float()).to(torch.float16)
+                for weights in (slot0_weights, slot1_weights)
+            ]
+            if fc1_pair_kind is None:
+                atoms = intermediate // 32
+                raw = torch.stack(
+                    (
+                        physical[0].view(1, atoms, 32),
+                        physical[1].view(1, atoms, 32),
+                    ),
+                    dim=2,
+                ).reshape(1, 2 * intermediate)
+                scales = torch.stack(
+                    (
+                        slot0_svh[expert].view(atoms, 32),
+                        slot1_svh[expert].view(atoms, 32),
+                    ),
+                    dim=1,
+                ).reshape(1, 2 * intermediate)
+                pre = _had128(raw, hadamard, store_fp16=False)
+                pre = _had128(
+                    pre * scales.float(), hadamard, store_fp16=False
+                )
+            else:
+                decoded = [
+                    _had128(
+                        physical[index],
+                        hadamard,
+                        svh=(slot0_svh, slot1_svh)[index][expert],
+                        store_fp16=False,
+                    )
+                    for index in range(2)
+                ]
+            if fc1_pair_kind == "P43":
+                # P43 stores each slot's funded K4 record before its logical
+                # first K3 record.
+                logical = torch.cat(
+                    (
+                        decoded[0][:, 128:],
+                        decoded[1][:, 128:],
+                        decoded[0][:, :128],
+                        decoded[1][:, :128],
+                    ),
+                    dim=1,
+                )
+            elif fc1_pair_kind == "P33":
+                logical = torch.cat(
+                    (
+                        decoded[0][:, :128],
+                        decoded[1][:, :128],
+                        decoded[0][:, 128:],
+                        decoded[1][:, 128:],
+                    ),
+                    dim=1,
+                )
+            elif fc1_pair_kind is not None:
+                raise ValueError(f"unsupported coupled FC1 pair kind {fc1_pair_kind}")
+            if fc1_pair_kind is not None:
+                pre = _had128(logical, hadamard, store_fp16=False)
+            pre = pre * pre_signs[expert].float()
+            gate = pre[:, 0::2]
+            up = pre[:, 1::2]
+            activated = (
+                4.0
+                * torch.tanh(gate / 4.0)
+                * torch.sigmoid(gate)
+                * 25.0
+                * torch.tanh(up / 25.0)
+            )
+            activated = activated * post_signs[expert].float()
+            activated = _had128(activated, hadamard, store_fp16=False)
+            activated = _had128(
+                activated * down_suh[expert].float(),
+                hadamard,
+                store_fp16=not quantize_activations,
+            )
+            if quantize_activations:
+                activated = _reference_mxfp8_rows(activated)
+            down = (
+                activated.float() @ down_weights[expert].float()
+            ).to(torch.float16)
+            route = _had128(down, hadamard, store_fp16=False)
+            route = route * down_svh[0 if int(down_svh.shape[0]) == 1 else expert]
+            route_values.append(route)
+
+        routed = sum(
+            router_weights[token, slot] * route_values[slot]
+            for slot in range(int(local_ids.shape[1]))
+        )
+        output[token] = _coupled_h512(routed, hadamard)[0]
+    return output
+
+
+def _reference_mxfp8_rows(source: torch.Tensor) -> torch.Tensor:
+    """Quantize logical K32 groups to E4M3 with UE8M0 power-of-two scales."""
+
+    m, k = source.shape
+    blocks = source.float().reshape(m, k // 32, 32)
+    max_abs = blocks.abs().amax(dim=-1, keepdim=True)
+    safe = torch.where(max_abs > 0, max_abs / 448.0, torch.ones_like(max_abs))
+    exponent = torch.ceil(torch.log2(safe)).clamp(-127, 127)
+    scale = torch.pow(torch.tensor(2.0, device=source.device), exponent)
+    scale = torch.where(max_abs > 0, scale, torch.ones_like(scale))
+    return (
+        (blocks / scale)
+        .to(torch.float8_e4m3fn)
+        .float()
+        .mul(scale)
+        .reshape(m, k)
+    )
+
+
+def _qsrt_p22_atom_extent_from_payloads(
+    w13: torch.Tensor,
+    w2: torch.Tensor,
+    ordinary_rotations: torch.Tensor,
+) -> torch.Tensor:
+    """Pack one TP-local pure-K2 extent in canonical atoms-v2 order."""
+
+    projections, experts, hidden_tiles, local_tiles, words = w13.shape
+    if projections != 2 or words != 32 or local_tiles % 2:
+        raise ValueError("unexpected pure-K2 upstream payload shape")
+    if tuple(w2.shape) != (experts, local_tiles, hidden_tiles, words):
+        raise ValueError("unexpected pure-K2 down payload shape")
+    atoms = local_tiles // 2
+    intermediate = local_tiles * 16
+    if tuple(ordinary_rotations.shape) != (experts, 3 * intermediate):
+        raise ValueError("unexpected pure-K2 local-scale shape")
+    matrix_bytes = hidden_tiles * 64 * torch.int16.itemsize
+    bundle_bytes = 3 * matrix_bytes + 3 * 64
+    output = torch.zeros(
+        (atoms, experts, bundle_bytes), dtype=torch.uint8, device=w13.device
+    )
+
+    for matrix_index in range(3):
+        if matrix_index < 2:
+            source = (
+                w13[matrix_index]
+                .reshape(experts, hidden_tiles, atoms, 2, 32)
+                .permute(2, 0, 3, 1, 4)
+                .contiguous()
+                .view(torch.uint8)
+                .reshape(atoms, experts, matrix_bytes)
+            )
+        else:
+            source = (
+                w2.reshape(experts, atoms, 2, hidden_tiles, 32)
+                .permute(1, 0, 2, 3, 4)
+                .contiguous()
+                .view(torch.uint8)
+                .reshape(atoms, experts, matrix_bytes)
+            )
+        begin = matrix_index * matrix_bytes
+        output[:, :, begin : begin + matrix_bytes].copy_(source)
+
+        scale_source = (
+            ordinary_rotations[
+                :,
+                matrix_index * intermediate : (matrix_index + 1) * intermediate,
+            ]
+            .reshape(experts, atoms, 32)
+            .permute(1, 0, 2)
+            .contiguous()
+            .view(torch.uint8)
+            .reshape(atoms, experts, 64)
+        )
+        scale_begin = 3 * matrix_bytes + matrix_index * 64
+        output[:, :, scale_begin : scale_begin + 64].copy_(scale_source)
+    return output.reshape(atoms, experts * bundle_bytes).contiguous()
+
+
+def _qsrt_coupled_h308_atom_extent_from_payloads(
+    w13_low: torch.Tensor,
+    w13_high: torch.Tensor,
+    w2_low: torch.Tensor,
+    w2_high: torch.Tensor,
+    ordinary_rotations: torch.Tensor,
+) -> torch.Tensor:
+    """Pack one static coupled-H308 pair in canonical atoms-v2 order."""
+
+    projections, experts, hidden_tiles, atoms, low_words = w13_low.shape
+    if projections != 2 or atoms != 8 or low_words % 16:
+        raise ValueError("unexpected coupled-H308 upstream payload shape")
+    high_words = int(w13_high.shape[-1])
+    if tuple(w13_high.shape[:-1]) != tuple(w13_low.shape[:-1]) or high_words % 16:
+        raise ValueError("coupled-H308 upstream halves disagree")
+    w2_low_words = int(w2_low.shape[-1])
+    w2_high_words = int(w2_high.shape[-1])
+    if tuple(w2_low.shape[:-1]) != (experts, atoms, hidden_tiles) or w2_low_words % 16:
+        raise ValueError("unexpected coupled-H308 down low-half shape")
+    if (
+        tuple(w2_high.shape[:-1]) != (experts, atoms, hidden_tiles)
+        or w2_high_words % 16
+    ):
+        raise ValueError("unexpected coupled-H308 down high-half shape")
+    intermediate = 2 * atoms * 16
+    if tuple(ordinary_rotations.shape) != (experts, 3 * intermediate):
+        raise ValueError("unexpected coupled-H308 local-scale shape")
+
+    fc1_low_bytes = hidden_tiles * low_words * torch.int16.itemsize
+    fc1_high_bytes = hidden_tiles * high_words * torch.int16.itemsize
+    fc1_matrix_bytes = fc1_low_bytes + fc1_high_bytes
+    fc2_low_bytes = hidden_tiles * w2_low_words * torch.int16.itemsize
+    fc2_high_bytes = hidden_tiles * w2_high_words * torch.int16.itemsize
+    fc2_matrix_bytes = fc2_low_bytes + fc2_high_bytes
+    bundle_bytes = 2 * fc1_matrix_bytes + fc2_matrix_bytes + 3 * 64
+    output = torch.empty(
+        (atoms, experts, bundle_bytes), dtype=torch.uint8, device=w13_low.device
+    )
+
+    cursor = 0
+    for matrix_index in range(3):
+        if matrix_index < 2:
+            low_bytes = fc1_low_bytes
+            high_bytes = fc1_high_bytes
+            matrix_bytes = fc1_matrix_bytes
+            low = (
+                w13_low[matrix_index]
+                .permute(2, 0, 1, 3)
+                .contiguous()
+                .view(torch.uint8)
+                .reshape(atoms, experts, low_bytes)
+            )
+            high = (
+                w13_high[matrix_index]
+                .permute(2, 0, 1, 3)
+                .contiguous()
+                .view(torch.uint8)
+                .reshape(atoms, experts, high_bytes)
+            )
+        else:
+            low_bytes = fc2_low_bytes
+            high_bytes = fc2_high_bytes
+            matrix_bytes = fc2_matrix_bytes
+            low = (
+                w2_low.permute(1, 0, 2, 3)
+                .contiguous()
+                .view(torch.uint8)
+                .reshape(atoms, experts, low_bytes)
+            )
+            high = (
+                w2_high.permute(1, 0, 2, 3)
+                .contiguous()
+                .view(torch.uint8)
+                .reshape(atoms, experts, high_bytes)
+            )
+        output[:, :, cursor : cursor + low_bytes].copy_(low)
+        output[
+            :, :, cursor + low_bytes : cursor + matrix_bytes
+        ].copy_(high)
+        cursor += matrix_bytes
+
+    for matrix_index in range(3):
+        values = ordinary_rotations[
+            :,
+            matrix_index * intermediate : (matrix_index + 1) * intermediate,
+        ]
+        stripes = torch.cat(
+            (
+                values[:, :128].reshape(experts, atoms, 16),
+                values[:, 128:].reshape(experts, atoms, 16),
+            ),
+            dim=2,
+        ).permute(1, 0, 2)
+        output[:, :, cursor : cursor + 64].copy_(
+            stripes.contiguous().view(torch.uint8).reshape(atoms, experts, 64)
+        )
+        cursor += 64
+    assert cursor == bundle_bytes
+    return output.reshape(atoms, experts * bundle_bytes).contiguous()
+
+
+def _qsrt_coupled_signs_reference(
+    length: int, *, draw: int, axis: int, device: torch.device
+) -> torch.Tensor:
+    if draw == 0:
+        return torch.ones(length, dtype=torch.float16, device=device)
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(
+        (
+            0x6A09E667F3BCC909 * draw
+            + 0xBB67AE8584CAA73B * axis
+        )
+        & ((1 << 63) - 1)
+    )
+    return (
+        torch.randint(0, 2, (length,), generator=generator)
+        .mul_(2)
+        .sub_(1)
+        .to(device=device, dtype=torch.float16)
+    )
+
+
+@pytest.mark.skipif(not _sm12x_available(), reason="requires an SM120/SM121 GPU")
+def test_coupled_k2_atom_extent_pads_short_tp_rank() -> None:
+    """Pad a complete 256-channel atom extent to the TP10 runtime width."""
+
+    torch.manual_seed(20260811)
+    device = torch.device("cuda", torch.cuda.current_device())
+    experts = 1
+    hidden = 3584
+    source_intermediate = 256
+    runtime_intermediate = 384
+    source_tiles = source_intermediate // 16
+    runtime_tiles = runtime_intermediate // 16
+    bits = 2
+    first_atom_slot = 24
+    draw = 6
+
+    source_w13 = torch.randint(
+        -32768,
+        32767,
+        (2, experts, hidden // 16, source_tiles, 16 * bits),
+        dtype=torch.int16,
+        device=device,
+    )
+    source_w2 = torch.randint(
+        -32768,
+        32767,
+        (experts, source_tiles, hidden // 16, 16 * bits),
+        dtype=torch.int16,
+        device=device,
+    )
+    source_rotations = (
+        0.875
+        + 0.25
+        * torch.rand((experts, 3 * source_intermediate), device=device)
+    ).to(torch.float16)
+    atom_payload = _qsrt_p22_atom_extent_from_payloads(
+        source_w13, source_w2, source_rotations
+    ).cpu()
+    gate_suh = torch.ones((1, hidden), dtype=torch.float16, device=device)
+    up_suh = torch.full(
+        (1, hidden), 1.125, dtype=torch.float16, device=device
+    )
+    down_svh = torch.ones((1, hidden), dtype=torch.float16, device=device)
+
+    prepared = _prepare_qsrt_p22_atom_v2_moe_weights(
+        atom_payload,
+        first_atom_slot=first_atom_slot,
+        rotation_draws=torch.tensor([draw], dtype=torch.uint8),
+        hidden_size=hidden,
+        intermediate_size=runtime_intermediate,
+        num_experts=experts,
+        activation="situ",
+        gate_suh=gate_suh,
+        up_suh=up_suh,
+        down_svh=down_svh,
+        params_dtype=torch.float16,
+        codebook="sqg_xor_cheb_t12",
+        tile_config=(128, 128, 128, 128),
+        dummy_scale=None,
+        workspace=None,
+    )
+
+    expected_w13 = torch.zeros(
+        (2, experts, hidden // 16, runtime_tiles, 16 * bits),
+        dtype=torch.int16,
+        device=device,
+    )
+    expected_w13[:, :, :, :source_tiles].copy_(source_w13)
+    expected_w2 = torch.zeros(
+        (experts, runtime_tiles, hidden // 16, 16 * bits),
+        dtype=torch.int16,
+        device=device,
+    )
+    expected_w2[:, :source_tiles].copy_(source_w2)
+    torch.testing.assert_close(
+        prepared.w13.view(torch.int16).view_as(expected_w13),
+        expected_w13,
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(
+        prepared.w2.view(torch.int16).view_as(expected_w2),
+        expected_w2,
+        rtol=0,
+        atol=0,
+    )
+
+    expected_rotations = torch.zeros(
+        (experts, 3 * runtime_intermediate),
+        dtype=torch.float16,
+        device=device,
+    )
+    for matrix_index in range(3):
+        expected_rotations[
+            :,
+            matrix_index * runtime_intermediate : matrix_index
+            * runtime_intermediate
+            + source_intermediate,
+        ].copy_(
+            source_rotations[
+                :,
+                matrix_index * source_intermediate : (matrix_index + 1)
+                * source_intermediate,
+            ]
+        )
+    expected_signs = torch.ones_like(expected_rotations)
+    expected_signs[:, : 2 * source_intermediate].copy_(
+        _qsrt_coupled_signs_reference(
+            2 * 3072, draw=draw, axis=1, device=device
+        )[
+            2 * first_atom_slot * 32 : 2 * first_atom_slot * 32
+            + 2 * source_intermediate
+        ].reshape(1, -1)
+    )
+    expected_signs[
+        :,
+        2 * runtime_intermediate : 2 * runtime_intermediate
+        + source_intermediate,
+    ].copy_(
+        _qsrt_coupled_signs_reference(
+            3072, draw=draw, axis=2, device=device
+        )[
+            first_atom_slot * 32 : first_atom_slot * 32 + source_intermediate
+        ].reshape(1, -1)
+    )
+    torch.testing.assert_close(
+        prepared.intermediate_rotations[:, : 3 * runtime_intermediate],
+        expected_rotations,
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(
+        prepared.intermediate_rotations[:, 3 * runtime_intermediate :],
+        expected_signs,
+        rtol=0,
+        atol=0,
+    )
+
+
+@pytest.mark.skipif(not _sm12x_available(), reason="requires an SM120/SM121 GPU")
+@pytest.mark.parametrize("first_atom_slot", [0, 48])
+def test_coupled_k2_fused_moe_matches_transform_reference_and_captures(
+    first_atom_slot: int,
+) -> None:
+    """Close uniform-K2 payloads through every coupled transform boundary."""
+
+    torch.manual_seed(20260810)
+    device = torch.device("cuda", torch.cuda.current_device())
+    experts = topk = m = 1
+    # Keep this closure at Kimi-K3's TP8 serving shape: seven H512 residual
+    # blocks and a 3,072 / 8 = 384-wide local intermediate extent.  This makes
+    # the coupled H128 boundaries, atom reassembly, and FC2 traversal cross
+    # multiple blocks and local tile groups.
+    hidden, intermediate, bits = 3584, 384, 2
+    tile_config = (128, 128, 128, 128)
+    w13 = torch.randint(
+        -32768,
+        32767,
+        (2, experts, hidden // 16, intermediate // 16, 16 * bits),
+        dtype=torch.int16,
+        device=device,
+    )
+    w2 = torch.randint(
+        -32768,
+        32767,
+        (experts, intermediate // 16, hidden // 16, 16 * bits),
+        dtype=torch.int16,
+        device=device,
+    )
+
+    def scales(shape: tuple[int, ...]) -> torch.Tensor:
+        return (0.875 + 0.25 * torch.rand(shape, device=device)).to(torch.float16)
+
+    gate_suh = scales((1, hidden)).contiguous()
+    up_suh = scales((1, hidden)).contiguous()
+    assert not torch.equal(gate_suh, up_suh)
+    source_suh = gate_suh if first_atom_slot < 48 else up_suh
+    ordinary_rotations = scales((experts, 3 * intermediate)).contiguous()
+    down_svh = scales((1, hidden)).contiguous()
+    draw = 6
+    pre_sign_begin = 2 * first_atom_slot * 32
+    post_sign_begin = first_atom_slot * 32
+    coupled_signs = torch.cat(
+        (
+            _qsrt_coupled_signs_reference(
+                2 * 3072, draw=draw, axis=1, device=device
+            )[pre_sign_begin : pre_sign_begin + 2 * intermediate],
+            _qsrt_coupled_signs_reference(
+                3072, draw=draw, axis=2, device=device
+            )[post_sign_begin : post_sign_begin + intermediate],
+        )
+    ).reshape(experts, 3 * intermediate)
+    # Serving keeps the canonical atom extent host-backed and streams bounded
+    # expert groups into the rank-local CUDA representation during load.
+    atom_payload = _qsrt_p22_atom_extent_from_payloads(
+        w13, w2, ordinary_rotations
+    ).cpu()
+    prepared = _prepare_qsrt_p22_atom_v2_moe_weights(
+        atom_payload,
+        first_atom_slot=first_atom_slot,
+        rotation_draws=torch.tensor([draw], dtype=torch.uint8),
+        hidden_size=hidden,
+        intermediate_size=intermediate,
+        num_experts=experts,
+        activation="situ",
+        gate_suh=gate_suh,
+        up_suh=up_suh,
+        down_svh=down_svh,
+        params_dtype=torch.float16,
+        codebook="sqg_xor_cheb_t12",
+        tile_config=tile_config,
+        dummy_scale=None,
+        workspace=None,
+    )
+    torch.testing.assert_close(
+        prepared.w13.view(torch.int16).view_as(w13), w13, rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        prepared.w2.view(torch.int16).view_as(w2), w2, rtol=0, atol=0
+    )
+    torch.testing.assert_close(prepared.gate_suh, source_suh, rtol=0, atol=0)
+    torch.testing.assert_close(prepared.up_suh, source_suh, rtol=0, atol=0)
+    torch.testing.assert_close(
+        prepared.intermediate_rotations[:, : 3 * intermediate],
+        ordinary_rotations,
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(
+        prepared.intermediate_rotations[:, 3 * intermediate :],
+        coupled_signs,
+        rtol=0,
+        atol=0,
+    )
+
+    slot0_weights = torch.stack(
+        [
+            _reconstruct_native(w13[0, expert], codebook="sqg_xor_cheb_t12")
+            for expert in range(experts)
+        ]
+    ).to(device)
+    slot1_weights = torch.stack(
+        [
+            _reconstruct_native(w13[1, expert], codebook="sqg_xor_cheb_t12")
+            for expert in range(experts)
+        ]
+    ).to(device)
+    down_weights = torch.stack(
+        [
+            _reconstruct_native(w2[expert], codebook="sqg_xor_cheb_t12")
+            for expert in range(experts)
+        ]
+    ).to(device)
+    x = torch.randn((m, hidden), device=device).to(torch.bfloat16)
+    ids = torch.zeros((m, topk), dtype=torch.int32, device=device)
+    router_weights = torch.ones((m, topk), dtype=torch.float32, device=device)
+    buffers = make_w4a16_packed_buffers(
+        prepared,
+        m=m,
+        topk=topk,
+        dtype=torch.float16,
+        device=device,
+        full_rotation=True,
+        block_size_m=8,
+    )
+    assert buffers.rotation_a_gate.data_ptr() == buffers.rotation_a_up.data_ptr()
+
+    def run() -> torch.Tensor:
+        return run_w4a16_moe(
+            x,
+            prepared,
+            router_weights,
+            ids,
+            activation="situ",
+            intermediate_cache13=buffers.intermediate_cache13,
+            intermediate_cache2=buffers.intermediate_cache2,
+            output=buffers.output,
+            fc1_c_tmp=buffers.fc1_c_tmp,
+            fc2_c_tmp=buffers.fc2_c_tmp,
+            packed_route_indices=buffers.packed_route_indices,
+            block_expert_ids=buffers.block_expert_ids,
+            packed_route_count=buffers.packed_route_count,
+            expert_offsets=buffers.expert_offsets,
+            expert_counts=buffers.expert_counts,
+            route_block_size_m=8,
+            intermediate_rotation_scales=prepared.intermediate_rotations,
+            full_rotation=True,
+            suh_gate_table=prepared.gate_suh,
+            suh_up_table=prepared.up_suh,
+            svh_table=down_svh,
+            rotation_a_gate=buffers.rotation_a_gate,
+            rotation_a_up=buffers.rotation_a_up,
+        )
+
+    actual = run().clone()
+    torch.cuda.synchronize(device)
+    hadamard = _hadamard_128(device)
+    expected_source = _coupled_h512(x.to(torch.float16), hadamard)
+    expected_source = (expected_source * source_suh.float()).to(torch.float16)
+    expected_source = _had128(
+        expected_source, hadamard, store_fp16=True
+    )
+    torch.testing.assert_close(
+        buffers.rotation_a_gate.view(-1, hidden)[:m],
+        expected_source,
+        rtol=1.0e-2,
+        atol=5.0e-7,
+    )
+    physical0 = (expected_source.float() @ slot0_weights[0].float()).to(
+        torch.float16
+    )
+    physical1 = (expected_source.float() @ slot1_weights[0].float()).to(
+        torch.float16
+    )
+    atoms = intermediate // 32
+    raw_pre = torch.stack(
+        (
+            physical0.view(m, atoms, 32),
+            physical1.view(m, atoms, 32),
+        ),
+        dim=2,
+    ).reshape(m, 2 * intermediate)
+    pre_scales = torch.stack(
+        (
+            ordinary_rotations[:, :intermediate].view(m, atoms, 32),
+            ordinary_rotations[:, intermediate : 2 * intermediate].view(
+                m, atoms, 32
+            ),
+        ),
+        dim=2,
+    ).reshape(m, 2 * intermediate)
+    expected_pre = _had128(raw_pre, hadamard, store_fp16=False)
+    expected_pre = _had128(
+        expected_pre * pre_scales.float(),
+        hadamard,
+        store_fp16=False,
+    )
+    expected_pre *= coupled_signs[:, : 2 * intermediate].float()
+    gate = expected_pre[:, 0::2]
+    up = expected_pre[:, 1::2]
+    expected_activated = (
+        4.0
+        * torch.tanh(gate / 4.0)
+        * torch.sigmoid(gate)
+        * 25.0
+        * torch.tanh(up / 25.0)
+    )
+    expected_activated *= coupled_signs[:, 2 * intermediate :].float()
+    expected_activated = _had128(
+        expected_activated, hadamard, store_fp16=False
+    )
+    expected_activated = _had128(
+        expected_activated * ordinary_rotations[:, 2 * intermediate :].float(),
+        hadamard,
+        store_fp16=True,
+    )
+    actual_activated = buffers.intermediate_cache2.view(-1, intermediate)[:m]
+    activation_relative_error = (
+        (actual_activated - expected_activated).norm()
+        / expected_activated.norm().clamp_min(1.0e-9)
+    )
+    assert float(activation_relative_error) <= 2.0e-2
+    reference = _reference_coupled_decoded(
+        x,
+        ids,
+        router_weights,
+        slot0_weights,
+        slot1_weights,
+        down_weights,
+        source_suh,
+        ordinary_rotations,
+        coupled_signs,
+        down_svh,
+    )
+    relative_error = (
+        (actual - reference).norm() / reference.norm().clamp_min(1.0e-9)
+    )
+    cosine = torch.nn.functional.cosine_similarity(
+        actual.flatten(), reference.flatten(), dim=0
+    )
+    assert float(relative_error) <= 2.0e-2
+    assert float(cosine) >= 0.9999
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = run()
+    graph.replay()
+    torch.cuda.synchronize(device)
+    assert torch.equal(captured, actual)
+
+
+
+
+@pytest.mark.skipif(not _sm12x_available(), reason="requires an SM120/SM121 GPU")
+@pytest.mark.parametrize("bits", [3, 4])
+def test_coupled_higher_rate_w4a16_matches_transform_reference(
+    bits: int,
+) -> None:
+    """Close uniform K3/K4 payloads through the coupled transform contract."""
+
+    torch.manual_seed(20260810 + bits)
+    device = torch.device("cuda", torch.cuda.current_device())
+    experts = topk = m = 1
+    hidden, intermediate = 512, 128
+    w13 = torch.randint(
+        -32768,
+        32767,
+        (2, experts, hidden // 16, intermediate // 16, 16 * bits),
+        dtype=torch.int16,
+        device=device,
+    )
+    w2 = torch.randint(
+        -32768,
+        32767,
+        (experts, intermediate // 16, hidden // 16, 16 * bits),
+        dtype=torch.int16,
+        device=device,
+    )
+
+    def scales(shape: tuple[int, ...]) -> torch.Tensor:
+        return (0.875 + 0.25 * torch.rand(shape, device=device)).to(torch.float16)
+
+    source_suh = scales((1, hidden)).contiguous()
+    ordinary_rotations = scales((experts, 3 * intermediate)).contiguous()
+    coupled_signs = (
+        torch.randint(
+            0,
+            2,
+            (experts, 3 * intermediate),
+            dtype=torch.int32,
+            device=device,
+        )
+        .mul_(2)
+        .sub_(1)
+        .to(torch.float16)
+    )
+    down_svh = scales((1, hidden)).contiguous()
+    prepared = prepare_trellis256_moe_weights(
+        w13,
+        w2,
+        hidden_size=hidden,
+        intermediate_size=intermediate,
+        num_experts=experts,
+        activation="situ",
+        params_dtype=torch.float16,
+        fc1_tile_n=128,
+        fc2_tile_n=128,
+        w13_layout="trellis3_t256_proj",
+        trellis_bits=bits,
+        codebook="sqg_xor_cheb_t12",
+        gate_suh=source_suh,
+        up_suh=source_suh,
+        intermediate_rotations=ordinary_rotations,
+        down_svh=down_svh,
+        tile_config=(128, 128, 128, 128),
+    )
+    prepared = replace(
+        prepared,
+        coupled_hadamard=True,
+        intermediate_rotations=torch.cat(
+            (ordinary_rotations, coupled_signs), dim=1
+        ).contiguous(),
+    )
+
+    slot0_weights = _reconstruct_native(
+        w13[0, 0], codebook="sqg_xor_cheb_t12"
+    ).unsqueeze(0).to(device)
+    slot1_weights = _reconstruct_native(
+        w13[1, 0], codebook="sqg_xor_cheb_t12"
+    ).unsqueeze(0).to(device)
+    down_weights = _reconstruct_native(
+        w2[0], codebook="sqg_xor_cheb_t12"
+    ).unsqueeze(0).to(device)
+    x = torch.randn((m, hidden), dtype=torch.bfloat16, device=device)
+    ids = torch.zeros((m, topk), dtype=torch.int32, device=device)
+    router_weights = torch.ones((m, topk), dtype=torch.float32, device=device)
+
+    buffers = make_w4a16_packed_buffers(
+        prepared,
+        m=m,
+        topk=topk,
+        dtype=torch.float16,
+        device=device,
+        full_rotation=True,
+        block_size_m=8,
+    )
+    actual_a16 = run_w4a16_moe(
+        x,
+        prepared,
+        router_weights,
+        ids,
+        activation="situ",
+        intermediate_cache13=buffers.intermediate_cache13,
+        intermediate_cache2=buffers.intermediate_cache2,
+        output=buffers.output,
+        fc1_c_tmp=buffers.fc1_c_tmp,
+        fc2_c_tmp=buffers.fc2_c_tmp,
+        packed_route_indices=buffers.packed_route_indices,
+        block_expert_ids=buffers.block_expert_ids,
+        packed_route_count=buffers.packed_route_count,
+        expert_offsets=buffers.expert_offsets,
+        expert_counts=buffers.expert_counts,
+        route_block_size_m=8,
+        intermediate_rotation_scales=prepared.intermediate_rotations,
+        full_rotation=True,
+        suh_gate_table=source_suh,
+        suh_up_table=source_suh,
+        svh_table=down_svh,
+        rotation_a_gate=buffers.rotation_a_gate,
+        rotation_a_up=buffers.rotation_a_up,
+    ).clone()
+    reference_a16 = _reference_coupled_decoded(
+        x,
+        ids,
+        router_weights,
+        slot0_weights,
+        slot1_weights,
+        down_weights,
+        source_suh,
+        ordinary_rotations,
+        coupled_signs,
+        down_svh,
+        fc1_pair_kind=prepared.fc1_trellis_pair_kind,
+    )
+    relative_a16 = (
+        (actual_a16 - reference_a16).norm()
+        / reference_a16.norm().clamp_min(1.0e-9)
+    )
+    cosine_a16 = torch.nn.functional.cosine_similarity(
+        actual_a16.flatten(), reference_a16.flatten(), dim=0
+    )
+    assert float(relative_a16) <= 2.0e-2
+    assert float(cosine_a16) >= 0.9999
+
 
 
 def _qsrt_atom_extent_from_pair_payloads(
@@ -982,6 +2142,429 @@ def test_qsrt_atom_fused_moe_matches_full_rotation_reference_and_captures(
     graph.replay()
     torch.cuda.synchronize(device)
     assert torch.equal(captured, actual)
+
+
+@pytest.mark.skipif(not _sm12x_available(), reason="requires an SM120/SM121 GPU")
+@pytest.mark.parametrize(
+    ("first_atom_slot", "fc1_bits", "fc2_bits"),
+    [
+        (0, (3, 3), (3, 3)),
+        (40, (4, 3), (3, 3)),
+        (88, (4, 3), (4, 4)),
+    ],
+)
+def test_coupled_h308_fused_moe_matches_transform_reference_and_captures(
+    first_atom_slot: int,
+    fc1_bits: tuple[int, int],
+    fc2_bits: tuple[int, int],
+) -> None:
+    """Close every static coupled-H308 pair shape through the fused kernel."""
+
+    torch.manual_seed(20260810 + first_atom_slot)
+    device = torch.device("cuda", torch.cuda.current_device())
+    experts = topk = m = 1
+    hidden, intermediate = 3584, 256
+    hidden_tiles, atoms = hidden // 16, intermediate // 32
+
+    w13_low = torch.randint(
+        -32768,
+        32767,
+        (2, experts, hidden_tiles, atoms, 16 * fc1_bits[0]),
+        dtype=torch.int16,
+        device=device,
+    )
+    w13_high = torch.randint(
+        -32768,
+        32767,
+        (2, experts, hidden_tiles, atoms, 16 * fc1_bits[1]),
+        dtype=torch.int16,
+        device=device,
+    )
+    w2_low = torch.randint(
+        -32768,
+        32767,
+        (experts, atoms, hidden_tiles, 16 * fc2_bits[0]),
+        dtype=torch.int16,
+        device=device,
+    )
+    w2_high = torch.randint(
+        -32768,
+        32767,
+        (experts, atoms, hidden_tiles, 16 * fc2_bits[1]),
+        dtype=torch.int16,
+        device=device,
+    )
+    ordinary_rotations = torch.ones(
+        (experts, 3 * intermediate), dtype=torch.float16, device=device
+    )
+    atom_payload = _qsrt_coupled_h308_atom_extent_from_payloads(
+        w13_low,
+        w13_high,
+        w2_low,
+        w2_high,
+        ordinary_rotations,
+    ).cpu()
+
+    def scales(shape: tuple[int, ...]) -> torch.Tensor:
+        return (0.875 + 0.25 * torch.rand(shape, device=device)).to(torch.float16)
+
+    gate_suh = scales((1, hidden)).contiguous()
+    up_suh = scales((1, hidden)).contiguous()
+    down_svh = scales((1, hidden)).contiguous()
+    draw = 5
+    prepared = _prepare_qsrt_coupled_h308_atom_v2_moe_weights(
+        atom_payload,
+        first_atom_slot=first_atom_slot,
+        rotation_draws=torch.tensor([draw], dtype=torch.uint8),
+        hidden_size=hidden,
+        intermediate_size=intermediate,
+        num_experts=experts,
+        activation="situ",
+        gate_suh=gate_suh,
+        up_suh=up_suh,
+        down_svh=down_svh,
+        params_dtype=torch.float16,
+        codebook="sqg_xor_cheb_t12",
+        tile_config=(64, 256, 64, 256),
+        dummy_scale=None,
+        workspace=None,
+    )
+    expected_w13 = torch.stack(
+        tuple(
+            torch.cat(
+                (
+                    w13_low[projection].reshape(experts, hidden_tiles, -1),
+                    w13_high[projection].reshape(experts, hidden_tiles, -1),
+                ),
+                dim=2,
+            ).reshape(-1)
+            for projection in range(2)
+        )
+    ).reshape(-1)
+    expected_w2 = torch.cat((w2_low.reshape(-1), w2_high.reshape(-1)))
+    assert torch.equal(prepared.w13.view(torch.int16), expected_w13)
+    assert torch.equal(prepared.w2.view(torch.int16), expected_w2)
+    assert prepared.fc1_trellis_pair_kind == (
+        "P43" if fc1_bits == (4, 3) else "P33"
+    )
+    assert prepared.fc2_trellis_pair_kind == (
+        "P44" if fc2_bits == (4, 4) else "P33"
+    )
+
+    slot_weights: list[torch.Tensor] = []
+    for projection in range(2):
+        low = _reconstruct_native(
+            w13_low[projection, 0], codebook="sqg_xor_cheb_t12"
+        )
+        high = _reconstruct_native(
+            w13_high[projection, 0], codebook="sqg_xor_cheb_t12"
+        )
+        # The GEMM output follows the serialized record order.  For P43 that
+        # is the funded K4 record followed by the K3 record; the coupled
+        # activation restores logical order.
+        slot_weights.append(
+            torch.cat((low, high), dim=1)
+            .unsqueeze(0)
+            .to(device)
+        )
+    down_weights = torch.cat(
+        (
+            _reconstruct_native(w2_low[0], codebook="sqg_xor_cheb_t12"),
+            _reconstruct_native(w2_high[0], codebook="sqg_xor_cheb_t12"),
+        ),
+        dim=0,
+    ).unsqueeze(0).to(device)
+    coupled_signs = prepared.intermediate_rotations[:, 3 * intermediate :]
+    source_suh = gate_suh if first_atom_slot < 48 else up_suh
+
+    x = (torch.randn((m, hidden), device=device) * 1.0e-3).to(torch.bfloat16)
+    ids = torch.zeros((m, topk), dtype=torch.int32, device=device)
+    router_weights = torch.ones((m, topk), dtype=torch.float32, device=device)
+    buffers = make_w4a16_packed_buffers(
+        prepared,
+        m=m,
+        topk=topk,
+        dtype=torch.float16,
+        device=device,
+        full_rotation=True,
+        block_size_m=8,
+    )
+
+    def run() -> torch.Tensor:
+        return run_w4a16_moe(
+            x,
+            prepared,
+            router_weights,
+            ids,
+            activation="situ",
+            intermediate_cache13=buffers.intermediate_cache13,
+            intermediate_cache2=buffers.intermediate_cache2,
+            output=buffers.output,
+            fc1_c_tmp=buffers.fc1_c_tmp,
+            fc2_c_tmp=buffers.fc2_c_tmp,
+            packed_route_indices=buffers.packed_route_indices,
+            block_expert_ids=buffers.block_expert_ids,
+            packed_route_count=buffers.packed_route_count,
+            expert_offsets=buffers.expert_offsets,
+            expert_counts=buffers.expert_counts,
+            route_block_size_m=8,
+            intermediate_rotation_scales=prepared.intermediate_rotations,
+            full_rotation=True,
+            suh_gate_table=prepared.gate_suh,
+            suh_up_table=prepared.up_suh,
+            svh_table=prepared.down_svh,
+            rotation_a_gate=buffers.rotation_a_gate,
+            rotation_a_up=buffers.rotation_a_up,
+        )
+
+    actual = run().clone()
+    torch.cuda.synchronize(device)
+    reference = _reference_coupled_decoded(
+        x,
+        ids,
+        router_weights,
+        slot_weights[0],
+        slot_weights[1],
+        down_weights,
+        source_suh,
+        ordinary_rotations,
+        coupled_signs,
+        down_svh,
+        fc1_pair_kind=prepared.fc1_trellis_pair_kind,
+    )
+    relative_error = (
+        (actual - reference).norm() / reference.norm().clamp_min(1.0e-9)
+    )
+    cosine = torch.nn.functional.cosine_similarity(
+        actual.flatten(), reference.flatten(), dim=0
+    )
+    assert float(relative_error) <= 2.0e-2
+    assert float(cosine) >= 0.9999
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = run()
+    graph.replay()
+    torch.cuda.synchronize(device)
+    assert torch.equal(captured, actual)
+
+
+@pytest.mark.skipif(not _sm12x_available(), reason="requires an SM120/SM121 GPU")
+@pytest.mark.parametrize("mode_values", [(0, 0), (1, 1), (0, 1)])
+def test_qsrt_atoms_v2_prepared_p33_p43_matches_full_rotation_reference(
+    mode_values: tuple[int, int],
+) -> None:
+    """Close exact compact offsets and seven-bit P43 staging end to end."""
+
+    torch.manual_seed(20260809)
+    device = torch.device("cuda", torch.cuda.current_device())
+    experts = topk = m = 2
+    hidden = intermediate = 256
+    hidden_tiles = hidden // 16
+    modes = torch.tensor(mode_values, dtype=torch.int64, device=device)
+
+    def make_pair(
+        p43: bool, shape: tuple[int, int], *, fc1: bool
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        low_bits, high_bits = ((4, 3) if p43 else (3, 3))
+        low = torch.randint(
+            -32768,
+            32767,
+            (*shape, 16 * low_bits),
+            dtype=torch.int16,
+            device=device,
+        )
+        high = torch.randint(
+            -32768,
+            32767,
+            (*shape, 16 * high_bits),
+            dtype=torch.int16,
+            device=device,
+        )
+        decoded = torch.cat(
+            (
+                _reconstruct_native(low, codebook="sqg_xor_cheb_t12"),
+                _reconstruct_native(high, codebook="sqg_xor_cheb_t12"),
+            ),
+            dim=1 if fc1 else 0,
+        )
+        if fc1:
+            payload = torch.cat(
+                (
+                    low.reshape(hidden_tiles, -1),
+                    high.reshape(hidden_tiles, -1),
+                ),
+                dim=-1,
+            ).reshape(-1)
+        else:
+            payload = torch.cat((low.reshape(-1), high.reshape(-1)))
+        return payload, decoded
+
+    w13_experts: list[list[torch.Tensor]] = [[], []]
+    w13_decoded: list[list[torch.Tensor]] = [[], []]
+    for projection in range(2):
+        for expert in range(experts):
+            payload, decoded = make_pair(
+                bool(mode_values[expert]), (hidden_tiles, 8), fc1=True
+            )
+            w13_experts[projection].append(payload)
+            w13_decoded[projection].append(decoded)
+    w2_experts: list[torch.Tensor] = []
+    w2_decoded: list[torch.Tensor] = []
+    for expert in range(experts):
+        payload, decoded = make_pair(
+            bool(mode_values[expert]), (8, hidden_tiles), fc1=False
+        )
+        w2_experts.append(payload)
+        w2_decoded.append(decoded)
+
+    w13_payload = torch.cat(
+        tuple(torch.cat(tuple(plane)) for plane in w13_experts)
+    ).contiguous()
+    w2_payload = torch.cat(tuple(w2_experts)).contiguous()
+    offsets_u32 = torch.tensor(
+        [0, w2_experts[0].numel() // 2], dtype=torch.int64, device=device
+    )
+
+    def scales(shape: tuple[int, ...]) -> torch.Tensor:
+        return (0.875 + 0.25 * torch.rand(shape, device=device)).to(torch.float16)
+
+    gate_suh = scales((1, hidden)).contiguous()
+    up_suh = scales((1, hidden)).contiguous()
+    intermediate_rotations = scales((experts, 3 * intermediate)).contiguous()
+    down_svh = scales((1, hidden)).contiguous()
+    prepared = _prepare_qsrt_p33_p43_moe_weights(
+        w13_payload,
+        w2_payload,
+        pair_offsets_u32=offsets_u32,
+        pair_is_p43=modes,
+        hidden_size=hidden,
+        intermediate_size=intermediate,
+        num_experts=experts,
+        activation="situ",
+        gate_suh=gate_suh,
+        up_suh=up_suh,
+        intermediate_rotations=intermediate_rotations,
+        down_svh=down_svh,
+    )
+    expected_descriptors = (offsets_u32 << 1) | modes
+    assert prepared.fc1_trellis_pair_kind == "P33_P43"
+    assert prepared.fc2_trellis_pair_kind == "P33_P43"
+    assert torch.equal(prepared.fc1_trellis_pair_modes, expected_descriptors)
+    assert torch.equal(prepared.fc2_trellis_pair_modes, expected_descriptors)
+    assert prepared.w13.numel() * 4 == w13_payload.numel() * 2
+    assert prepared.w2.numel() * 4 == w2_payload.numel() * 2
+
+    gate_weights = torch.stack(w13_decoded[0]).to(device)
+    up_weights = torch.stack(w13_decoded[1]).to(device)
+    down_weights = torch.stack(w2_decoded).to(device)
+    x = (torch.randn((m, hidden), device=device) * 1.0e-3).to(torch.bfloat16)
+    ids = torch.tensor([[0, 1], [1, 0]], dtype=torch.int32, device=device)
+    router_weights = torch.tensor(
+        [[0.65, 0.35], [0.2, 0.8]], dtype=torch.float32, device=device
+    )
+    buffers = make_w4a16_packed_buffers(
+        prepared,
+        m=m,
+        topk=topk,
+        dtype=torch.float16,
+        device=device,
+        full_rotation=True,
+        block_size_m=8,
+    )
+    actual = run_w4a16_moe(
+        x,
+        prepared,
+        router_weights,
+        ids,
+        activation="situ",
+        intermediate_cache13=buffers.intermediate_cache13,
+        intermediate_cache2=buffers.intermediate_cache2,
+        output=buffers.output,
+        fc1_c_tmp=buffers.fc1_c_tmp,
+        fc2_c_tmp=buffers.fc2_c_tmp,
+        packed_route_indices=buffers.packed_route_indices,
+        block_expert_ids=buffers.block_expert_ids,
+        packed_route_count=buffers.packed_route_count,
+        expert_offsets=buffers.expert_offsets,
+        expert_counts=buffers.expert_counts,
+        route_block_size_m=8,
+        intermediate_rotation_scales=intermediate_rotations,
+        full_rotation=True,
+        suh_gate_table=gate_suh,
+        suh_up_table=up_suh,
+        svh_table=down_svh,
+        rotation_a_gate=buffers.rotation_a_gate,
+        rotation_a_up=buffers.rotation_a_up,
+    ).clone()
+    torch.cuda.synchronize(device)
+    reference = _reference_full_rotation_decoded(
+        x,
+        ids,
+        router_weights,
+        gate_weights,
+        up_weights,
+        down_weights,
+        gate_suh,
+        up_suh,
+        intermediate_rotations,
+        down_svh,
+        activation="situ",
+    )
+    relative_error = (actual - reference).norm() / reference.norm().clamp_min(1.0e-9)
+    cosine = torch.nn.functional.cosine_similarity(
+        actual.flatten(), reference.flatten(), dim=0
+    )
+    if mode_values == (0, 0):
+        legacy_modes = torch.zeros(experts, dtype=torch.int32, device=device)
+        legacy_prepared = replace(
+            prepared,
+            fc1_trellis_pair_kind="PDYNAMIC",
+            fc2_trellis_pair_kind="PDYNAMIC",
+            fc1_trellis_pair_modes=legacy_modes,
+            fc2_trellis_pair_modes=legacy_modes,
+        )
+        legacy_buffers = make_w4a16_packed_buffers(
+            legacy_prepared,
+            m=m,
+            topk=topk,
+            dtype=torch.float16,
+            device=device,
+            full_rotation=True,
+            block_size_m=8,
+        )
+        legacy_actual = run_w4a16_moe(
+            x,
+            legacy_prepared,
+            router_weights,
+            ids,
+            activation="situ",
+            intermediate_cache13=legacy_buffers.intermediate_cache13,
+            intermediate_cache2=legacy_buffers.intermediate_cache2,
+            output=legacy_buffers.output,
+            fc1_c_tmp=legacy_buffers.fc1_c_tmp,
+            fc2_c_tmp=legacy_buffers.fc2_c_tmp,
+            packed_route_indices=legacy_buffers.packed_route_indices,
+            block_expert_ids=legacy_buffers.block_expert_ids,
+            packed_route_count=legacy_buffers.packed_route_count,
+            expert_offsets=legacy_buffers.expert_offsets,
+            expert_counts=legacy_buffers.expert_counts,
+            route_block_size_m=8,
+            intermediate_rotation_scales=intermediate_rotations,
+            full_rotation=True,
+            suh_gate_table=gate_suh,
+            suh_up_table=up_suh,
+            svh_table=down_svh,
+            rotation_a_gate=legacy_buffers.rotation_a_gate,
+            rotation_a_up=legacy_buffers.rotation_a_up,
+        ).clone()
+        torch.cuda.synchronize(device)
+        legacy_relative_error = (
+            (legacy_actual - reference).norm() / reference.norm().clamp_min(1.0e-9)
+        )
+        assert float(legacy_relative_error) <= 2.0e-2
+    assert float(relative_error) <= 2.0e-2
+    assert float(cosine) >= 0.999
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA storage")
@@ -1553,7 +3136,7 @@ def test_qsrt_pdynamic_cache_key_ignores_expert_count() -> None:
     assert compact.fc1.__cache_key__ == complete.fc1.__cache_key__
     assert compact.fc2.__cache_key__ == complete.fc2.__cache_key__
 
-    with pytest.raises(ValueError, match="require PDYNAMIC mode tables"):
+    with pytest.raises(ValueError, match="matching runtime mode tables"):
         make_kernel(27, "P24")
 
 

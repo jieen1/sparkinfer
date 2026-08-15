@@ -3,7 +3,7 @@
 - ``fused_moe``: fused tensor-parallel routed-expert FFN (route -> FC1 ->
   activation -> FC2 -> scatter); recipes nvfp4/mxfp4/w4a8_mx/w4a8_nvfp4/w4a16,
   including legacy ``exl3_trellis_mcg`` and TP-independent
-  ``qsrt_sqg_e4m3`` W4A16 source formats.
+  ``qsrt_sqg_e4m3`` plus uniform-K5/K6 ``sqg_fp16_d3l`` W4A16 source formats.
 - ``ep_moe``: expert-parallel MoE (replicated input -> local partial;
   cross-rank reduction is the caller's job, typically ``comm.pcie``).
 """

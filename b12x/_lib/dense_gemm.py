@@ -1889,10 +1889,29 @@ class DenseGemmKernel:
         accumulators = cute.make_rmem_tensor(acc_shape, self.acc_dtype)
         if cutlass.const_expr(self.block_fp8):
             stage_accumulators = cute.make_rmem_tensor(acc_shape, self.acc_dtype)
-            c_identity = cute.make_identity_tensor(
+            block_fp8_c_identity = cute.make_identity_tensor(
                 cute.slice_(self.tile_shape_mnk, (None, None, 0))
             )
-            coord_mn = _reshape_acc_to_mn(thr_mma.partition_C(c_identity))
+            block_fp8_coord_mn = _reshape_acc_to_mn(
+                thr_mma.partition_C(block_fp8_c_identity)
+            )
+        if cutlass.const_expr(self.swap_ab):
+            swap_ab_acc_mn = _reshape_acc_to_mn(accumulators, transpose=True)
+            swap_ab_c_identity = cute.make_identity_tensor(
+                (self.tile_shape_mnk[1], self.tile_shape_mnk[0])
+            )
+            swap_ab_coord_mn = _reshape_acc_to_mn(
+                thr_mma.partition_C(swap_ab_c_identity),
+                transpose=True,
+            )
+        if cutlass.const_expr(self.split_k_slices > 1):
+            split_k_acc_mn = _reshape_acc_to_mn(accumulators)
+            split_k_c_identity = cute.make_identity_tensor(
+                cute.slice_(self.tile_shape_mnk, (None, None, 0))
+            )
+            split_k_coord_mn = _reshape_acc_to_mn(
+                thr_mma.partition_C(split_k_c_identity)
+            )
 
         # Cluster/thread sync
         if cute.size(self.cluster_shape_mnk) > 1:
@@ -2345,7 +2364,7 @@ class DenseGemmKernel:
                                 self._accumulate_block_fp8_stage(
                                     accumulators,
                                     stage_accumulators,
-                                    coord_mn,
+                                    block_fp8_coord_mn,
                                     directSFA_mkl,
                                     directSFB_nkl,
                                     tile_coord_mnl,
@@ -2490,7 +2509,7 @@ class DenseGemmKernel:
                             self._accumulate_block_fp8_stage(
                                 accumulators,
                                 stage_accumulators,
-                                coord_mn,
+                                block_fp8_coord_mn,
                                 directSFA_mkl,
                                 directSFB_nkl,
                                 tile_coord_mnl,
@@ -2498,19 +2517,13 @@ class DenseGemmKernel:
                             )
 
                 if cutlass.const_expr(self.swap_ab):
-                    acc_mn = _reshape_acc_to_mn(accumulators, transpose=True)
-                    c_identity = cute.make_identity_tensor(
-                        (self.tile_shape_mnk[1], self.tile_shape_mnk[0])
-                    )
-                    coord_mn = _reshape_acc_to_mn(
-                        thr_mma.partition_C(c_identity),
-                        transpose=True,
-                    )
-                    for acc_m in cutlass.range_constexpr(cute.size(acc_mn.shape[0])):
+                    for acc_m in cutlass.range_constexpr(
+                        cute.size(swap_ab_acc_mn.shape[0])
+                    ):
                         for acc_n in cutlass.range_constexpr(
-                            cute.size(acc_mn.shape[1])
+                            cute.size(swap_ab_acc_mn.shape[1])
                         ):
-                            coord = coord_mn[acc_m, acc_n]
+                            coord = swap_ab_coord_mn[acc_m, acc_n]
                             m_coord = (
                                 tile_coord_mnl[0] * Int32(self.tile_shape_mnk[0])
                                 + coord[1]
@@ -2529,7 +2542,7 @@ class DenseGemmKernel:
                                         tile_coord_mnl[2],
                                     )
                                 ] = epilogue_op(
-                                    (alpha_value * acc_mn[acc_m, acc_n]).to(
+                                    (alpha_value * swap_ab_acc_mn[acc_m, acc_n]).to(
                                         self.c_dtype
                                     )
                                 )
@@ -2688,24 +2701,17 @@ class DenseGemmKernel:
 
                             gmem_coord = (epi_m, epi_n)
                             if cutlass.const_expr(self.split_k_slices > 1):
-                                acc_mn = _reshape_acc_to_mn(accumulators)
-                                c_identity = cute.make_identity_tensor(
-                                    cute.slice_(self.tile_shape_mnk, (None, None, 0))
-                                )
-                                coord_mn = _reshape_acc_to_mn(
-                                    thr_mma.partition_C(c_identity)
-                                )
                                 if cutlass.const_expr(self.split_k_atomic_bf16):
                                     for acc_m in cutlass.range_constexpr(
-                                        cute.size(acc_mn.shape[0])
+                                        cute.size(split_k_acc_mn.shape[0])
                                     ):
                                         for acc_n_pair in cutlass.range_constexpr(
-                                            cute.size(acc_mn.shape[1]) // 2
+                                            cute.size(split_k_acc_mn.shape[1]) // 2
                                         ):
                                             acc_n0 = acc_n_pair * 2
                                             acc_n1 = acc_n0 + 1
-                                            coord0 = coord_mn[acc_m, acc_n0]
-                                            coord1 = coord_mn[acc_m, acc_n1]
+                                            coord0 = split_k_coord_mn[acc_m, acc_n0]
+                                            coord1 = split_k_coord_mn[acc_m, acc_n1]
                                             m_coord0 = (
                                                 tile_coord_mnl[0]
                                                 * Int32(self.tile_shape_mnk[0])
@@ -2748,14 +2754,19 @@ class DenseGemmKernel:
                                                         directC_mnl,
                                                         c_offset,
                                                     ),
-                                                    alpha_value * acc_mn[acc_m, acc_n0],
-                                                    alpha_value * acc_mn[acc_m, acc_n1],
+                                                    alpha_value
+                                                    * split_k_acc_mn[acc_m, acc_n0],
+                                                    alpha_value
+                                                    * split_k_acc_mn[acc_m, acc_n1],
                                                 )
                                         if cutlass.const_expr(
-                                            cute.size(acc_mn.shape[1]) % 2 == 1
+                                            cute.size(split_k_acc_mn.shape[1]) % 2
+                                            == 1
                                         ):
-                                            acc_n = cute.size(acc_mn.shape[1]) - 1
-                                            coord = coord_mn[acc_m, acc_n]
+                                            acc_n = (
+                                                cute.size(split_k_acc_mn.shape[1]) - 1
+                                            )
+                                            coord = split_k_coord_mn[acc_m, acc_n]
                                             m_coord = (
                                                 tile_coord_mnl[0]
                                                 * Int32(self.tile_shape_mnk[0])
@@ -2782,17 +2793,18 @@ class DenseGemmKernel:
                                                         directC_mnl,
                                                         c_offset,
                                                     ),
-                                                    alpha_value * acc_mn[acc_m, acc_n],
+                                                    alpha_value
+                                                    * split_k_acc_mn[acc_m, acc_n],
                                                 )
                                 else:
                                     split_idx = Int32(block_idx[1])
                                     for acc_m in cutlass.range_constexpr(
-                                        cute.size(acc_mn.shape[0])
+                                        cute.size(split_k_acc_mn.shape[0])
                                     ):
                                         for acc_n in cutlass.range_constexpr(
-                                            cute.size(acc_mn.shape[1])
+                                            cute.size(split_k_acc_mn.shape[1])
                                         ):
-                                            coord = coord_mn[acc_m, acc_n]
+                                            coord = split_k_coord_mn[acc_m, acc_n]
                                             m_coord = (
                                                 tile_coord_mnl[0]
                                                 * Int32(self.tile_shape_mnk[0])
@@ -2808,7 +2820,10 @@ class DenseGemmKernel:
                                             ) and n_coord < Int32(directC_mnl.shape[1]):
                                                 directC_mnl[
                                                     (m_coord, n_coord, split_idx)
-                                                ] = alpha_value * acc_mn[acc_m, acc_n]
+                                                ] = (
+                                                    alpha_value
+                                                    * split_k_acc_mn[acc_m, acc_n]
+                                                )
                             else:
                                 # Type conversion with alpha scaling
                                 tRS_rD_out = cute.make_rmem_tensor(
@@ -7177,6 +7192,9 @@ def dense_gemm(
     ``plain_fp8``: emit non-block-scaled E4M3 warp MMA while reusing the
     SM12x dense pipeline. The scalar ``alpha`` carries the combined activation
     and weight dequantization scale.
+
+    ``row_scale``: optional contiguous ``(M,)`` tensor in the C dtype, applied
+    per output row in the epilogue. MX-FP6 only.
 
     ``alpha_col``: optional plain-FP8 decode-only FP32 output-channel scale
     vector. The kernel multiplies the shared scalar ``alpha`` by one

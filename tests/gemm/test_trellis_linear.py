@@ -21,18 +21,6 @@ from b12x.moe._shared.kernels.activations import (
     SITU_DEFAULT_BETA,
     SITU_DEFAULT_LINEAR_BETA,
 )
-from b12x.moe._shared.kernels.trellis_w4a8_pair import (
-    run_trellis_w4a8_fc1_routes,
-    run_trellis_w4a8_fc2_routes,
-)
-from b12x.moe._shared.kernels.trellis_w4a8 import (
-    make_trellis_w4a8_moe_scratch,
-    run_trellis_w4a8_moe,
-)
-from b12x.moe._shared.kernels.trellis_w4a8_transform import (
-    run_trellis_w4a8_activation_rotation,
-    run_trellis_w4a8_input_rotation,
-)
 from b12x.moe._shared.kernels.w4a16.kernel import (
     _run_trellis_dense_hadamard128,
     _trellis256_dense_launch_geometry,
@@ -236,6 +224,8 @@ def _reference_mxfp8_rows(source: torch.Tensor) -> torch.Tensor:
         .mul(scale)
         .reshape(m, k)
     )
+
+
 
 
 def test_prepare_weight_delegates_without_copy(monkeypatch) -> None:
@@ -545,8 +535,15 @@ def test_k6_small_m_cuda_graph_replay_is_stable() -> None:
     )
     x = torch.randn((m, features), dtype=torch.float16, device=device)
     output = torch.empty_like(x)
+    gemm_output = torch.empty_like(x)
     rotated_f16 = torch.empty_like(x)
-    kwargs = {"output": output, "rotated_f16": rotated_f16}
+    c_tmp = torch.empty((1 << 20,), dtype=torch.float32, device=device)
+    kwargs = {
+        "output": output,
+        "gemm_output": gemm_output,
+        "rotated_f16": rotated_f16,
+        "c_tmp": c_tmp,
+    }
 
     expected = trellis_linear.run(x, weight, **kwargs).clone()
     torch.cuda.synchronize(device)
@@ -625,71 +622,8 @@ def test_dense_bf16_reuses_all_scratch_during_cuda_graph_capture(bits: int) -> N
 
 @pytest.mark.skipif(not _sm12x_available(), reason="requires an SM120/SM121 GPU")
 @pytest.mark.parametrize("bits", [2, 3, 4])
-def test_dense_mul1_e4m3_matches_reference(bits: int) -> None:
-    torch.manual_seed(0xE4A3 + bits)
-    device = torch.device("cuda", torch.cuda.current_device())
-    m = 2
-    features = 128
-    trellis = torch.randint(
-        -32768,
-        32767,
-        (features // 16, features // 16, 16 * bits),
-        dtype=torch.int16,
-        device=device,
-    )
-    scale = torch.ones(features, dtype=torch.float16, device=device)
-    weight = trellis_linear.prepare_weight(
-        trellis,
-        scale,
-        scale.clone(),
-        mul1_e4m3=torch.tensor(
-            0x83DCD12D, dtype=torch.uint32, device=device
-        ),
-        params_dtype=torch.float16,
-    )
-    assert weight.trellis_codebook == "mul1-e4m3"
-    reference_weight = _reconstruct_native(
-        trellis, codebook="mul1-e4m3"
-    ).to(device)
-    x = (torch.randn((m, features), device=device) * 1.0e-3).to(torch.float16)
-
-    def identity_hadamard(
-        source: torch.Tensor,
-        destination: torch.Tensor,
-        _left_scale,
-        _right_scale,
-        _scale: float,
-    ) -> None:
-        destination.copy_(source)
-
-    output = torch.empty_like(x)
-    gemm_output = torch.empty_like(x)
-    rotated_f16 = torch.empty_like(x)
-    c_tmp = torch.empty((1 << 20,), dtype=torch.float32, device=device)
-    actual = trellis_linear.run(
-        x,
-        weight,
-        output=output,
-        gemm_output=gemm_output,
-        rotated_f16=rotated_f16,
-        c_tmp=c_tmp,
-        hadamard_128=identity_hadamard,
-    ).clone()
-    torch.cuda.synchronize(device)
-
-    expected = (x.float() @ reference_weight.float()).to(torch.float16)
-    relative_error = (actual - expected).float().norm() / expected.float().norm()
-    cosine = torch.nn.functional.cosine_similarity(
-        actual.float().flatten(), expected.float().flatten(), dim=0
-    )
-    assert float(relative_error) <= 2.0e-2
-    assert float(cosine) >= 0.999
-
-
-@pytest.mark.skipif(not _sm12x_available(), reason="requires an SM120/SM121 GPU")
-@pytest.mark.parametrize("bits", [2, 3, 4])
-def test_dense_sqg_cheb_normal_e4m3_matches_reference(bits: int) -> None:
-    """Close the exact SQG labels through the real W4A16 GEMM fragment path."""
+def test_dense_sqg_xor_cheb_t12_matches_reference(bits: int) -> None:
+    """Close the runtime SQG labels through the W4A16 GEMM fragment path."""
 
     torch.manual_seed(0x535147 + bits)
     device = torch.device("cuda", torch.cuda.current_device())
@@ -707,12 +641,12 @@ def test_dense_sqg_cheb_normal_e4m3_matches_reference(bits: int) -> None:
         trellis,
         scale,
         scale.clone(),
-        codebook="sqg-cheb-normal-e4m3",
+        codebook="sqg_xor_cheb_t12",
         params_dtype=torch.float16,
     )
-    assert weight.trellis_codebook == "sqg-cheb-normal-e4m3"
+    assert weight.trellis_codebook == "sqg_xor_cheb_t12"
     reference_weight = _reconstruct_native(
-        trellis, codebook="sqg-cheb-normal-e4m3"
+        trellis, codebook="sqg_xor_cheb_t12"
     ).to(device)
     x = (torch.randn((m, features), device=device) * 1.0e-3).to(torch.float16)
 
@@ -755,9 +689,9 @@ def test_dense_sqg_cheb_normal_e4m3_matches_reference(bits: int) -> None:
 @pytest.mark.parametrize(
     "orthogonal_tiles",
     [16, 224],
-    ids=["square-proof", "k3-tp12"],
+    ids=["square-proof", "wide-axis"],
 )
-@pytest.mark.parametrize("codebook", ["mcg", "sqg-cheb-normal-e4m3"])
+@pytest.mark.parametrize("codebook", ["mcg", "sqg_xor_cheb_t12"])
 def test_dense_pair_matches_independent_reference_and_captures(
     pair_kind: str,
     bits: tuple[int, int],
@@ -897,562 +831,10 @@ def test_dense_pair_matches_independent_reference_and_captures(
     assert torch.equal(captured, actual)
 
 
-@pytest.mark.skipif(not _sm12x_available(), reason="requires an SM120/SM121 GPU")
-@pytest.mark.parametrize(("pair_kind", "bits"), [("P24", (2, 4)), ("P33", (3, 3))])
-@pytest.mark.parametrize("rate_axis", ["k", "n"])
-@pytest.mark.parametrize("codebook", ["mul1-e4m3", "sqg-cheb-normal-e4m3"])
-def test_dense_pair_e4m3_w4a8_matches_quantized_reference_and_captures(
-    pair_kind: str,
-    bits: tuple[int, int],
-    rate_axis: str,
-    codebook: str,
-) -> None:
-    """Exercise compact P24/P33 addressing through the real E4M3 MMA path."""
-    torch.manual_seed(0x4A8 + sum(bits) + (rate_axis == "n"))
-    device = torch.device("cuda", torch.cuda.current_device())
-    low_bits, high_bits = bits
-    orthogonal_tiles = 8
-    if rate_axis == "n":
-        low = torch.randint(
-            -32768,
-            32767,
-            (orthogonal_tiles, 8, 16 * low_bits),
-            dtype=torch.int16,
-            device=device,
-        )
-        high = torch.randint(
-            -32768,
-            32767,
-            (orthogonal_tiles, 8, 16 * high_bits),
-            dtype=torch.int16,
-            device=device,
-        )
-        reference_weight = torch.cat(
-            (
-                _reconstruct_native(low, codebook=codebook),
-                _reconstruct_native(high, codebook=codebook),
-            ),
-            dim=1,
-        ).to(device)
-    else:
-        low = torch.randint(
-            -32768,
-            32767,
-            (8, orthogonal_tiles, 16 * low_bits),
-            dtype=torch.int16,
-            device=device,
-        )
-        high = torch.randint(
-            -32768,
-            32767,
-            (8, orthogonal_tiles, 16 * high_bits),
-            dtype=torch.int16,
-            device=device,
-        )
-        reference_weight = torch.cat(
-            (
-                _reconstruct_native(low, codebook=codebook),
-                _reconstruct_native(high, codebook=codebook),
-            ),
-            dim=0,
-        ).to(device)
-
-    payload = torch.cat((low.reshape(-1), high.reshape(-1))).contiguous()
-    size_k, size_n = reference_weight.shape
-    codebook_kwargs = (
-        {
-            "mul1_e4m3": torch.tensor(
-                0x83DCD12D, dtype=torch.uint32, device=device
-            )
-        }
-        if codebook == "mul1-e4m3"
-        else {"codebook": codebook}
-    )
-    weight = trellis_linear.prepare_pair_weight(
-        payload,
-        torch.ones(size_k, dtype=torch.float16, device=device),
-        torch.ones(size_n, dtype=torch.float16, device=device),
-        pair_kind=pair_kind,
-        rate_axis=rate_axis,
-        params_dtype=torch.float16,
-        **codebook_kwargs,
-    )
-    m = 16
-    x = (torch.randn((m, size_k), device=device) * 0.125).to(torch.float16)
-
-    def identity_hadamard(
-        source: torch.Tensor,
-        destination: torch.Tensor,
-        _left_scale,
-        _right_scale,
-        _scale: float,
-    ) -> None:
-        destination.copy_(source)
-
-    output = torch.empty((m, size_n), dtype=torch.float16, device=device)
-    rotated_f16 = torch.empty_like(x)
-    quantized = empty_mxfp8_rows_for_dense_gemm(m, size_k, device=device)
-    gemm_output_f16 = torch.empty_like(output)
-    kwargs = {
-        "output": output,
-        "rotated_f16": rotated_f16,
-        "quantized": quantized,
-        "gemm_output_f16": gemm_output_f16,
-        "hadamard_128": identity_hadamard,
-    }
-    actual = trellis_linear.run_w4a8(x, weight, **kwargs).clone()
-    torch.cuda.synchronize(device)
-
-    x_quantized = _reference_mxfp8_rows(x)
-    expected = (x_quantized @ reference_weight.float()).to(torch.float16)
-    torch.testing.assert_close(actual, expected, rtol=2.0e-3, atol=2.0e-2)
-
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        captured = trellis_linear.run_w4a8(x, weight, **kwargs)
-    graph.replay()
-    torch.cuda.synchronize(device)
-    assert torch.equal(captured, actual)
 
 
-@pytest.mark.skipif(not _sm12x_available(), reason="requires an SM120/SM121 GPU")
-@pytest.mark.parametrize("broadcast_suh", [False, True])
-def test_route_major_w4a8_rotations_match_exl_transform_order_and_capture(
-    broadcast_suh: bool,
-) -> None:
-    torch.manual_seed(20260804)
-    device = torch.device("cuda", torch.cuda.current_device())
-    experts, hidden, intermediate, tokens, topk = 3, 256, 256, 2, 2
-    routes = tokens * topk
-    scale_rows = 1 if broadcast_suh else experts
-
-    prepared = SimpleNamespace(
-        hidden_size=hidden,
-        num_experts=experts,
-        gate_suh=(
-            0.75 + 0.5 * torch.rand((scale_rows, hidden), device=device)
-        ).half(),
-        up_suh=(
-            0.75 + 0.5 * torch.rand((scale_rows, hidden), device=device)
-        ).half(),
-        intermediate_rotations=(
-            0.75
-            + 0.5
-            * torch.rand((experts, 3 * intermediate), device=device)
-        ).half(),
-    )
-    source = torch.randn((tokens, hidden), device=device).bfloat16()
-    route_experts = torch.tensor(
-        [0, 2, 1, 0], dtype=torch.int32, device=device
-    )
-    gate_rot = torch.empty(
-        (routes, hidden), dtype=torch.float16, device=device
-    )
-    up_rot = torch.empty_like(gate_rot)
-    run_trellis_w4a8_input_rotation(
-        source,
-        route_experts,
-        prepared,
-        gate_rot,
-        up_rot,
-        topk=topk,
-    )
-
-    source_routes = source.to(torch.float16).repeat_interleave(topk, dim=0)
-    scale_indices = (
-        torch.zeros_like(route_experts) if broadcast_suh else route_experts
-    ).long()
-    expected_gate = _hadamard128_reference(
-        (source_routes.float() * prepared.gate_suh[scale_indices].float()).half()
-    ).half()
-    expected_up = _hadamard128_reference(
-        (source_routes.float() * prepared.up_suh[scale_indices].float()).half()
-    ).half()
-    torch.testing.assert_close(gate_rot, expected_gate, rtol=1.0e-3, atol=2.0e-3)
-    torch.testing.assert_close(up_rot, expected_up, rtol=1.0e-3, atol=2.0e-3)
-
-    gate = (torch.randn((routes, intermediate), device=device) * 0.25).half()
-    up = (torch.randn_like(gate) * 0.25).half()
-    activated = torch.empty_like(gate)
-    run_trellis_w4a8_activation_rotation(
-        gate, up, route_experts, prepared, activated
-    )
-    rotations = prepared.intermediate_rotations[route_experts.long()]
-    gate_canonical = _hadamard128_reference(gate) * rotations[:, :intermediate]
-    up_canonical = (
-        _hadamard128_reference(up)
-        * rotations[:, intermediate : 2 * intermediate]
-    )
-    situ_gate = (
-        SITU_DEFAULT_BETA
-        * torch.tanh(gate_canonical / SITU_DEFAULT_BETA)
-        * torch.sigmoid(gate_canonical)
-    )
-    situ_up = SITU_DEFAULT_LINEAR_BETA * torch.tanh(
-        up_canonical / SITU_DEFAULT_LINEAR_BETA
-    )
-    expected_activated = _hadamard128_reference(
-        situ_gate
-        * situ_up
-        * rotations[:, 2 * intermediate : 3 * intermediate]
-    ).half()
-    torch.testing.assert_close(
-        activated, expected_activated, rtol=3.0e-3, atol=3.0e-3
-    )
-
-    gate_before = gate_rot.clone()
-    up_before = up_rot.clone()
-    activated_before = activated.clone()
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        run_trellis_w4a8_input_rotation(
-            source,
-            route_experts,
-            prepared,
-            gate_rot,
-            up_rot,
-            topk=topk,
-        )
-        run_trellis_w4a8_activation_rotation(
-            gate, up, route_experts, prepared, activated
-        )
-    graph.replay()
-    torch.cuda.synchronize(device)
-    assert torch.equal(gate_rot, gate_before)
-    assert torch.equal(up_rot, up_before)
-    assert torch.equal(activated, activated_before)
 
 
-@pytest.mark.skipif(not _sm12x_available(), reason="requires an SM120/SM121 GPU")
-def test_route_major_e4m3_w4a8_honors_separate_dynamic_pair_modes() -> None:
-    """Mix P33/P24 experts and independently select FC1 versus FC2 modes."""
-    codebook = "sqg_xor_cheb_t12"
-    torch.manual_seed(20260803)
-    device = torch.device("cuda", torch.cuda.current_device())
-    experts = 2
-    hidden = 128
-    intermediate = 256
-    hidden_tiles = hidden // 16
-    n_tiles = hidden // 16
-    fc1_modes = torch.tensor([0, 1], dtype=torch.int32, device=device)
-    fc2_modes = torch.tensor([1, 0], dtype=torch.int32, device=device)
-
-    w13_payload = torch.empty(
-        (2, experts, hidden_tiles * 8 * 16 * 6),
-        dtype=torch.int16,
-        device=device,
-    )
-    w13_reference = torch.empty(
-        (2, experts, hidden, intermediate),
-        dtype=torch.float16,
-        device=device,
-    )
-    for projection in range(2):
-        for expert in range(experts):
-            low_bits, high_bits = (2, 4) if int(fc1_modes[expert]) else (3, 3)
-            low = torch.randint(
-                -32768,
-                32767,
-                (hidden_tiles, 8, 16 * low_bits),
-                dtype=torch.int16,
-                device=device,
-            )
-            high = torch.randint(
-                -32768,
-                32767,
-                (hidden_tiles, 8, 16 * high_bits),
-                dtype=torch.int16,
-                device=device,
-            )
-            w13_payload[projection, expert].copy_(
-                torch.cat((low.reshape(-1), high.reshape(-1)))
-            )
-            w13_reference[projection, expert].copy_(
-                torch.cat(
-                    (
-                        _reconstruct_native(low, codebook=codebook),
-                        _reconstruct_native(high, codebook=codebook),
-                    ),
-                    dim=1,
-                ).to(device)
-            )
-
-    w2_payload = torch.empty(
-        (experts, hidden_tiles * 8 * 16 * 6),
-        dtype=torch.int16,
-        device=device,
-    )
-    w2_reference = torch.empty(
-        (experts, intermediate, hidden), dtype=torch.float16, device=device
-    )
-    for expert in range(experts):
-        low_bits, high_bits = (2, 4) if int(fc2_modes[expert]) else (3, 3)
-        low = torch.randint(
-            -32768,
-            32767,
-            (8, n_tiles, 16 * low_bits),
-            dtype=torch.int16,
-            device=device,
-        )
-        high = torch.randint(
-            -32768,
-            32767,
-            (8, n_tiles, 16 * high_bits),
-            dtype=torch.int16,
-            device=device,
-        )
-        w2_payload[expert].copy_(
-            torch.cat((low.reshape(-1), high.reshape(-1)))
-        )
-        w2_reference[expert].copy_(
-            torch.cat(
-                (
-                    _reconstruct_native(low, codebook=codebook),
-                    _reconstruct_native(high, codebook=codebook),
-                ),
-                dim=0,
-            ).to(device)
-        )
-
-    prepared = prepare_qsrt_pair_moe_weights(
-        w13_payload,
-        w2_payload,
-        hidden_size=hidden,
-        intermediate_size=intermediate,
-        num_experts=experts,
-        activation="situ",
-        fc1_pair_kind=fc1_modes,
-        fc2_pair_kind=fc2_modes,
-        gate_suh=torch.ones((1, hidden), dtype=torch.float16, device=device),
-        up_suh=torch.ones((1, hidden), dtype=torch.float16, device=device),
-        intermediate_rotations=torch.ones(
-            (experts, 3 * intermediate), dtype=torch.float16, device=device
-        ),
-        down_svh=torch.ones((1, hidden), dtype=torch.float16, device=device),
-        params_dtype=torch.float16,
-        codebook=codebook,
-        tile_config=(64, 256, 128, 128),
-    )
-    route_experts = torch.tensor([0, 1], dtype=torch.int32, device=device)
-    routes = int(route_experts.numel())
-    decode_kwargs = {"sqg_direct_lut": True}
-
-    gate_x = (torch.randn((routes, hidden), device=device) * 0.125).half()
-    up_x = (torch.randn((routes, hidden), device=device) * 0.125).half()
-    gate_q = empty_mxfp8_rows_for_dense_gemm(routes, hidden, device=device)
-    up_q = empty_mxfp8_rows_for_dense_gemm(routes, hidden, device=device)
-    quantize_mxfp8_rows_cute(
-        gate_x,
-        gate_q.values,
-        gate_q.scale_rows,
-        gate_q.scale_mma,
-        value_order="trellis_native_mma",
-    )
-    quantize_mxfp8_rows_cute(
-        up_x,
-        up_q.values,
-        up_q.scale_rows,
-        up_q.scale_mma,
-        value_order="trellis_native_mma",
-    )
-    gate_out = torch.empty((routes, intermediate), dtype=torch.float16, device=device)
-    up_out = torch.empty_like(gate_out)
-    run_trellis_w4a8_fc1_routes(
-        gate_q,
-        up_q,
-        prepared,
-        route_experts,
-        gate_out,
-        up_out,
-        **decode_kwargs,
-    )
-
-    gate_xq = _reference_mxfp8_rows(gate_x)
-    up_xq = _reference_mxfp8_rows(up_x)
-    expected_gate = torch.stack(
-        [gate_xq[r] @ w13_reference[0, int(route_experts[r])].float() for r in range(routes)]
-    ).half()
-    expected_up = torch.stack(
-        [up_xq[r] @ w13_reference[1, int(route_experts[r])].float() for r in range(routes)]
-    ).half()
-    torch.testing.assert_close(gate_out, expected_gate, rtol=2.0e-3, atol=2.0e-2)
-    torch.testing.assert_close(up_out, expected_up, rtol=2.0e-3, atol=2.0e-2)
-
-    down_x = (torch.randn((routes, intermediate), device=device) * 0.125).half()
-    down_q = empty_mxfp8_rows_for_dense_gemm(routes, intermediate, device=device)
-    quantize_mxfp8_rows_cute(
-        down_x,
-        down_q.values,
-        down_q.scale_rows,
-        down_q.scale_mma,
-        value_order="trellis_native_mma",
-    )
-    down_out = torch.empty((routes, hidden), dtype=torch.float16, device=device)
-    run_trellis_w4a8_fc2_routes(
-        down_q, prepared, route_experts, down_out, **decode_kwargs
-    )
-    down_xq = _reference_mxfp8_rows(down_x)
-    expected_down = torch.stack(
-        [down_xq[r] @ w2_reference[int(route_experts[r])].float() for r in range(routes)]
-    ).half()
-    torch.testing.assert_close(down_out, expected_down, rtol=2.0e-3, atol=2.0e-2)
-
-    fc1_gate_before = gate_out.clone()
-    fc1_up_before = up_out.clone()
-    fc2_before = down_out.clone()
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        run_trellis_w4a8_fc1_routes(
-            gate_q,
-            up_q,
-            prepared,
-            route_experts,
-            gate_out,
-            up_out,
-            **decode_kwargs,
-        )
-        run_trellis_w4a8_fc2_routes(
-            down_q, prepared, route_experts, down_out, **decode_kwargs
-        )
-    graph.replay()
-    torch.cuda.synchronize(device)
-    assert torch.equal(gate_out, fc1_gate_before)
-    assert torch.equal(up_out, fc1_up_before)
-    assert torch.equal(down_out, fc2_before)
-
-    # Compose the transforms, both MXFP8 quantizers, direct FC1/FC2 decode,
-    # and the route-weighted inverse rotation into one graph-safe MoE path.
-    source = (torch.randn((1, hidden), device=device) * 0.125).bfloat16()
-    topk_ids = route_experts.reshape(1, -1)
-    topk_weights = torch.tensor(
-        [[0.625, 0.375]], dtype=torch.float32, device=device
-    )
-    scratch = make_trellis_w4a8_moe_scratch(
-        m=1,
-        topk=2,
-        hidden_size=hidden,
-        intermediate_size=intermediate,
-        device=device,
-    )
-    actual = run_trellis_w4a8_moe(
-        source, prepared, topk_weights, topk_ids, scratch
-    ).clone()
-    torch.cuda.synchronize(device)
-
-    source_routes = source.to(torch.float16).repeat_interleave(2, dim=0)
-    gate_rot_ref = _hadamard128_reference(
-        (source_routes.float() * prepared.gate_suh[0].float()).half()
-    ).half()
-    up_rot_ref = _hadamard128_reference(
-        (source_routes.float() * prepared.up_suh[0].float()).half()
-    ).half()
-    gate_quant_ref = _reference_mxfp8_rows(gate_rot_ref)
-    up_quant_ref = _reference_mxfp8_rows(up_rot_ref)
-    gate_fc1_ref = torch.stack(
-        [
-            gate_quant_ref[r]
-            @ w13_reference[0, int(route_experts[r])].float()
-            for r in range(routes)
-        ]
-    ).half()
-    up_fc1_ref = torch.stack(
-        [
-            up_quant_ref[r] @ w13_reference[1, int(route_experts[r])].float()
-            for r in range(routes)
-        ]
-    ).half()
-    rotations = prepared.intermediate_rotations[route_experts.long()]
-    gate_canonical = (
-        _hadamard128_reference(gate_fc1_ref)
-        * rotations[:, :intermediate].float()
-    )
-    up_canonical = (
-        _hadamard128_reference(up_fc1_ref)
-        * rotations[:, intermediate : 2 * intermediate].float()
-    )
-    activated_ref = _hadamard128_reference(
-        SITU_DEFAULT_BETA
-        * torch.tanh(gate_canonical / SITU_DEFAULT_BETA)
-        * torch.sigmoid(gate_canonical)
-        * SITU_DEFAULT_LINEAR_BETA
-        * torch.tanh(up_canonical / SITU_DEFAULT_LINEAR_BETA)
-        * rotations[:, 2 * intermediate : 3 * intermediate].float()
-    ).half()
-    activated_quant_ref = _reference_mxfp8_rows(activated_ref)
-    fc2_ref = torch.stack(
-        [
-            activated_quant_ref[r]
-            @ w2_reference[int(route_experts[r])].float()
-            for r in range(routes)
-        ]
-    ).half()
-    canonical_routes = _hadamard128_reference(fc2_ref)
-    expected = (
-        canonical_routes
-        * prepared.down_svh[0].float()
-        * topk_weights.reshape(-1, 1)
-    ).sum(dim=0, keepdim=True)
-    torch.testing.assert_close(actual, expected, rtol=4.0e-3, atol=3.0e-2)
-
-    graph_output_before = actual.clone()
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        graph_output = run_trellis_w4a8_moe(
-            source, prepared, topk_weights, topk_ids, scratch
-        )
-    graph.replay()
-    torch.cuda.synchronize(device)
-    assert torch.equal(graph_output, graph_output_before)
-
-    global_ids = torch.tensor([[4, 7]], dtype=torch.int32, device=device)
-    expert_map = torch.full((8,), -1, dtype=torch.int32, device=device)
-    expert_map[4] = 0
-    expert_map[7] = 1
-    mapped = run_trellis_w4a8_moe(
-        source,
-        prepared,
-        topk_weights,
-        global_ids,
-        scratch,
-        expert_map=expert_map,
-    ).clone()
-    torch.cuda.synchronize(device)
-    assert torch.equal(mapped, actual)
-
-    # A route owned by the other hybrid tier maps to -1 and contributes zero.
-    partial_global_ids = torch.tensor(
-        [[4, 3]], dtype=torch.int32, device=device
-    )
-    partial = run_trellis_w4a8_moe(
-        source,
-        prepared,
-        topk_weights,
-        partial_global_ids,
-        scratch,
-        expert_map=expert_map,
-    ).clone()
-    partial_expected = (
-        canonical_routes[0]
-        * prepared.down_svh[0].float()
-        * topk_weights[0, 0]
-    ).reshape(1, -1)
-    torch.testing.assert_close(
-        partial, partial_expected, rtol=4.0e-3, atol=3.0e-2
-    )
-
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        mapped_graph_output = run_trellis_w4a8_moe(
-            source,
-            prepared,
-            topk_weights,
-            global_ids,
-            scratch,
-            expert_map=expert_map,
-        )
-    graph.replay()
-    torch.cuda.synchronize(device)
-    assert torch.equal(mapped_graph_output, mapped)
 
 
 @pytest.mark.skipif(not _sm12x_available(), reason="requires an SM120/SM121 GPU")

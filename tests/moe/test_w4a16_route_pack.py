@@ -8,6 +8,7 @@ import torch
 from b12x.moe._shared.kernels.w4a16.kernel import pack_topk_routes_by_expert
 from b12x.moe._shared.kernels.w4a16.host import (
     route_block_sizes_for_capacity,
+    route_pack_capacity,
     select_route_block_size_m,
 )
 
@@ -303,3 +304,84 @@ def test_pack_topk_routes_by_expert_ignores_invalid_ids() -> None:
     assert torch.equal(
         payload[expected_ids[payload] == 4].sort().values, torch.tensor([2, 5])
     )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("num_experts", [896, 1024])
+@pytest.mark.parametrize("tokens", [1, 8, 64])
+def test_pack_topk_routes_by_expert_large_expert_decode_capture(
+    num_experts: int, tokens: int
+) -> None:
+    topk = 16
+    block_size = 8
+    torch.manual_seed(20260811 + num_experts + tokens)
+    topk_ids = (
+        torch.stack(
+            [
+                torch.randperm(num_experts, device="cuda")[:topk]
+                for _ in range(tokens)
+            ]
+        )
+        .to(torch.int32)
+        .contiguous()
+    )
+    numel = topk_ids.numel()
+    _, cap_routes, cap_blocks = route_pack_capacity(
+        numel, block_size, num_experts, topk=topk
+    )
+    workspaces = {
+        "packed_route_indices": torch.empty(
+            cap_routes, dtype=torch.int32, device="cuda"
+        ),
+        "block_expert_ids": torch.empty(
+            cap_blocks, dtype=torch.int32, device="cuda"
+        ),
+        "packed_route_count": torch.empty(1, dtype=torch.int32, device="cuda"),
+        "expert_offsets": torch.empty(
+            num_experts + 1, dtype=torch.int32, device="cuda"
+        ),
+        "expert_counts": torch.empty(
+            num_experts, dtype=torch.int32, device="cuda"
+        ),
+    }
+
+    def run() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return pack_topk_routes_by_expert(
+            topk_ids, block_size, num_experts, **workspaces
+        )
+
+    run()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        local_packed_routes, local_block_experts, local_packed_route_count = run()
+    graph.replay()
+    torch.cuda.synchronize()
+
+    (
+        expected_ids,
+        expected_valid,
+        expected_packed_route_count,
+        expected_block_experts,
+    ) = _expected_route_pack(topk_ids, block_size, num_experts)
+
+    sentinel = int(numel)
+    valid = int(expected_packed_route_count.item())
+    valid_blocks = valid // block_size
+    assert torch.equal(local_packed_route_count.cpu(), expected_packed_route_count)
+    assert torch.equal(local_block_experts[:valid_blocks].cpu(), expected_block_experts)
+    assert bool(torch.all(local_block_experts[valid_blocks:] == -1).item())
+    assert bool(torch.all(local_packed_routes[valid:] == sentinel).item())
+
+    host_packed_routes = local_packed_routes[:valid].detach().cpu().to(torch.int64)
+    host_route_payload = host_packed_routes[host_packed_routes < sentinel]
+    assert host_route_payload.numel() == int(expected_valid.sum().item())
+    for expert in range(num_experts):
+        actual = (
+            host_route_payload[expected_ids[host_route_payload] == expert].sort().values
+        )
+        expected = torch.nonzero(
+            expected_valid & (expected_ids == expert), as_tuple=False
+        )
+        expected = expected.flatten().sort().values
+        assert torch.equal(actual, expected), expert

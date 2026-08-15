@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import torch
+
+from b12x._lib.quant.sqg_fp16_d3l import SQG_FP16_D3L
 
 from b12x.moe._shared.kernels.w4a16.host import (
     W4A16PackedBuffers,
@@ -37,6 +39,18 @@ _QSRT_ATOM_BUNDLE_BYTES = 129_216
 _QSRT_MATRIX_TRELLIS_OFFSETS = (0, 43_008, 86_016)
 _QSRT_MATRIX_SCALE_OFFSETS = (129_024, 129_088, 129_152)
 _QSRT_EXPERT_ROTATION_MULTIPLIER = 5
+_QSRT_V2_P33_MATRIX_TRELLIS_BYTES = 43_008
+_QSRT_V2_P43_MATRIX_TRELLIS_BYTES = 50_176
+_QSRT_V2_P44_MATRIX_TRELLIS_BYTES = 57_344
+_QSRT_V2_P33_ATOM_BUNDLE_BYTES = 129_216
+_QSRT_V2_P43_ATOM_BUNDLE_BYTES = 150_720
+_QSRT_V2_COUPLED_H308_P43_P33_ATOM_BUNDLE_BYTES = 143_552
+_QSRT_V2_COUPLED_H308_P43_P44_ATOM_BUNDLE_BYTES = 157_888
+_QSRT_V2_P22_MATRIX_TRELLIS_BYTES = 28_672
+_QSRT_V2_P22_ATOM_BUNDLE_BYTES = 86_208
+_QSRT_V2_PROFILE_H308 = "k3x22_k4x2"
+_QSRT_V2_PROFILE_COUPLED_K2 = "k2_coupled_h512_h128"
+_QSRT_V2_PROFILE_COUPLED_H308 = "k3x22_k4x2_coupled_h512_h128"
 # Canonical W13 layout names are "w13"/"w31"; accept the physical FC1-half
 # spellings as aliases. Logical checkpoint order "w13" arrives up/gate and
 # needs a swap before the kernel's SwiGLU; "w31" is already kernel-native
@@ -147,7 +161,7 @@ class PreparedW4A16MoeWeights:
     w13_layout: str = "packed"
     weight_layout: str = "trellis3_t256"
     scale_format: str = "e4m3_k32"
-    # Native trellis tiles use the sole runtime SQG-XOR-Cheb-T12 codebook.
+    # Native tiles use MCG, K2/K3/K4 SQG-XOR-Cheb-T12, or K5/K6 FP16-D3L.
     trellis_codebook: str | None = None
     trellis_bits: int = 3
     # Optional compact fixed-payload pair specialization.  FC1's pair lies on
@@ -155,9 +169,11 @@ class PreparedW4A16MoeWeights:
     # selected separately while every matrix remains exactly three bpw.
     fc1_trellis_pair_kind: str | None = None
     fc2_trellis_pair_kind: str | None = None
-    # PDYNAMIC uses one int32 descriptor per local expert: 0=P33, 1=P24.
-    # These are cold, graph-stable inputs; the fixed-size payload itself stays
-    # byte-identical regardless of the selected descriptor.
+    # The fixed-size K3/K3 versus K2/K4 representation uses one int32 mode per
+    # local expert: zero selects K3/K3 and one selects K2/K4. The K3/K3 versus
+    # K4/K3 representation uses one int64 descriptor per local expert. Bit
+    # zero selects K4/K3 and the remaining bits store the exact uint32 offset
+    # into that matrix's compact payload pool.
     fc1_trellis_pair_modes: torch.Tensor | None = None
     fc2_trellis_pair_modes: torch.Tensor | None = None
     # Projection-specific EXL3 input incoherence scales.  They remain optional
@@ -168,6 +184,11 @@ class PreparedW4A16MoeWeights:
     up_suh: torch.Tensor | None = None
     intermediate_rotations: torch.Tensor | None = None
     down_svh: torch.Tensor | None = None
+    # Coupled transforms add an exact activation-boundary reparameterization
+    # around the per-matrix incoherence transforms. The rotation rows contain
+    # [gate I, up I, down I, preactivation 2I, postactivation I]. The 512-wide
+    # residual transforms use a fixed all-positive draw and need no table.
+    coupled_hadamard: bool = False
     tile_config: tuple[int, int, int, int] | None = None
 
 
@@ -1485,6 +1506,7 @@ _TRELLIS256_W13_LAYOUTS = {"packed", "trellis3_t256_proj"}
 _TRELLIS256_CODEBOOKS = {
     "mcg": "mcg",
     "sqg_xor_cheb_t12": "sqg_xor_cheb_t12",
+    SQG_FP16_D3L: SQG_FP16_D3L,
 }
 _TRELLIS256_CODEBOOK_SENTINELS = {
     0xCBAC1FED: "mcg",
@@ -1507,9 +1529,16 @@ def _normalize_trellis256_codebook(codebook: str | int) -> str:
     if normalized is None:
         raise ValueError(
             f"unsupported trellis256 codebook {codebook!r}; expected "
-            "'mcg' or 'sqg_xor_cheb_t12'"
+            "'mcg', 'sqg_xor_cheb_t12', or 'sqg_fp16_d3l'"
         )
     return normalized
+
+
+def _validate_trellis256_codebook_bits(codebook: str, bits: int) -> None:
+    if codebook == "sqg_xor_cheb_t12" and bits not in (2, 3, 4):
+        raise ValueError("sqg_xor_cheb_t12 is defined only for K2/K3/K4")
+    if codebook == SQG_FP16_D3L and bits not in (5, 6):
+        raise ValueError("sqg_fp16_d3l is defined only for uniform K5/K6")
 
 
 def _trellis256_random_native_tensor(
@@ -1643,13 +1672,14 @@ def prepare_trellis256_moe_weights(
         raise ValueError("trellis3_t256 W4A16 weights require fp16 or bf16 activations")
     requested_trellis_bits = None if trellis_bits is None else int(trellis_bits)
     if requested_trellis_bits is not None and requested_trellis_bits not in (
+        2,
         3,
         4,
         5,
         6,
     ):
         raise ValueError(
-            "EXL3 trellis3_t256 bits must be one of 3, 4, 5, or 6, "
+            "trellis3_t256 bits must be one of 2, 3, 4, 5, or 6, "
             f"got {requested_trellis_bits}"
         )
     if num_experts <= 0:
@@ -1768,9 +1798,9 @@ def prepare_trellis256_moe_weights(
                 f"trellis3_t256 w13/w2 bitrate mismatch: {w13_bits} vs {w2_bits}"
             )
         resolved_trellis_bits = w13_bits
-        if resolved_trellis_bits not in (3, 4, 5, 6):
+        if resolved_trellis_bits not in (2, 3, 4, 5, 6):
             raise ValueError(
-                "legacy EXL3 trellis3_t256 tensors must encode 3, 4, 5, or "
+                "trellis3_t256 tensors must encode 2, 3, 4, 5, or "
                 f"6 bpw, got {resolved_trellis_bits}"
             )
         if (
@@ -1943,6 +1973,9 @@ def prepare_trellis256_moe_weights(
                 "trellis3_t256 tile_config K dimensions must divide the model geometry"
             )
 
+    _validate_trellis256_codebook_bits(
+        normalized_codebook, resolved_trellis_bits
+    )
     if dummy_scale is None:
         dummy_scale = torch.zeros(4, dtype=torch.uint8, device=resolved_device)
     else:
@@ -1987,7 +2020,13 @@ def prepare_trellis256_moe_weights(
         params_dtype=params_dtype,
         fc1_tile_n=fc1_tile_n,
         fc2_tile_n=fc2_tile_n,
-        source_format="exl3_trellis_mcg",
+        source_format=(
+            "exl3_trellis_mcg"
+            if normalized_codebook == "mcg"
+            else "qsrt_sqg_e4m3"
+            if normalized_codebook == "sqg_xor_cheb_t12"
+            else SQG_FP16_D3L
+        ),
         w13_layout=w13_layout,
         weight_layout="trellis3_t256",
         scale_format="e4m3_k32",
@@ -2120,6 +2159,7 @@ def prepare_trellis256_dense_weight(
         mul1_e4m3=mul1_e4m3,
         codebook=codebook,
     )
+    _validate_trellis256_codebook_bits(normalized_codebook, trellis_bits)
     if dummy_scale is None:
         dummy_scale = torch.zeros(4, dtype=torch.uint8, device=device)
     else:
@@ -2511,6 +2551,1051 @@ def prepare_qsrt_pair_moe_weights(
     )
 
 
+def _prepare_qsrt_p33_p43_moe_weights(
+    w13_payload: torch.Tensor,
+    w2_payload: torch.Tensor,
+    *,
+    pair_offsets_u32: torch.Tensor,
+    pair_is_p43: torch.Tensor,
+    hidden_size: int,
+    intermediate_size: int,
+    num_experts: int,
+    activation: str,
+    gate_suh: torch.Tensor,
+    up_suh: torch.Tensor,
+    intermediate_rotations: torch.Tensor,
+    down_svh: torch.Tensor,
+    params_dtype: torch.dtype = torch.float16,
+    codebook: str = "sqg_xor_cheb_t12",
+    tile_config: tuple[int, int, int, int] = (64, 256, 64, 256),
+    dummy_scale: torch.Tensor | None = None,
+    workspace: torch.Tensor | None = None,
+) -> PreparedW4A16MoeWeights:
+    """Bind the P33/P43 pools decoded from one atoms-v2 extent.
+
+    ``w13_payload`` is projection-major and ``w2_payload`` is expert-major.
+    Within every pool, each expert owns one complete 256-channel pair in
+    physical record order.  P33 entries contain six bits per coefficient pair;
+    P43 entries contain seven.  ``pair_offsets_u32`` gives the exact start of
+    each expert in one W13 projection plane and in W2.  No expert is padded.
+
+    The caller must already have applied one common whole-record placement to
+    gate, up, and down.  This routine validates compact geometry; it never
+    changes logical funding or permutes channels.
+    """
+
+    hidden_size = int(hidden_size)
+    intermediate_size = int(intermediate_size)
+    num_experts = int(num_experts)
+    if hidden_size <= 0 or hidden_size % 128:
+        raise ValueError(
+            "QSRT P33/P43 preparation requires hidden_size to be a positive "
+            "multiple of 128"
+        )
+    if intermediate_size != 256:
+        raise ValueError("one prepared QSRT P33/P43 extent must own 256 channels")
+    if num_experts <= 0 or not validate_activation(activation):
+        raise ValueError("QSRT P33/P43 preparation requires gated experts")
+    if params_dtype != torch.float16:
+        raise ValueError("QSRT P33/P43 preparation requires fp16 operands")
+    if _normalize_trellis256_codebook(codebook) != "sqg_xor_cheb_t12":
+        raise ValueError("QSRT P33/P43 preparation supports only sqg_xor_cheb_t12")
+    if w13_payload.dtype != torch.int16 or w2_payload.dtype != torch.int16:
+        raise TypeError("QSRT P33/P43 payloads must use torch.int16")
+    if not w13_payload.is_cuda or not w2_payload.is_cuda:
+        raise ValueError("QSRT P33/P43 preparation requires CUDA payloads")
+    if w13_payload.device != w2_payload.device:
+        raise ValueError("w13_payload and w2_payload must share one CUDA device")
+    if not w13_payload.is_contiguous() or not w2_payload.is_contiguous():
+        raise ValueError("QSRT P33/P43 payloads must be contiguous")
+    if w13_payload.ndim != 1 or w2_payload.ndim != 1:
+        raise ValueError("QSRT P33/P43 payload pools must be flat")
+    if int(w13_payload.data_ptr()) % 16 or int(w2_payload.data_ptr()) % 16:
+        raise ValueError("QSRT P33/P43 payloads must be at least 16-byte aligned")
+    device = w13_payload.device
+
+    for name, value in (
+        ("pair_offsets_u32", pair_offsets_u32),
+        ("pair_is_p43", pair_is_p43),
+    ):
+        if not isinstance(value, torch.Tensor):
+            raise TypeError(f"{name} must be a tensor")
+        if value.device != device or tuple(value.shape) != (num_experts,):
+            raise ValueError(f"{name} must have shape {(num_experts,)} on {device}")
+        if not value.is_contiguous():
+            raise ValueError(f"{name} must be contiguous")
+    if pair_offsets_u32.dtype != torch.int64:
+        raise TypeError("pair_offsets_u32 must use int64")
+    if pair_is_p43.dtype not in {
+        torch.bool,
+        torch.uint8,
+        torch.int8,
+        torch.int16,
+        torch.int32,
+        torch.int64,
+    }:
+        raise TypeError("pair_is_p43 must use an integer or bool dtype")
+    modes = pair_is_p43.to(dtype=torch.int64).contiguous()
+    if not bool(torch.all((modes == 0) | (modes == 1))):
+        raise ValueError("pair_is_p43 values must be 0=P33 or 1=P43")
+
+    hidden_tiles = hidden_size // 16
+    p33_u32 = hidden_tiles * 8 * 8 * 6
+    p43_u32 = hidden_tiles * 8 * 8 * 7
+    lengths_u32 = torch.where(
+        modes != 0,
+        torch.full_like(modes, p43_u32),
+        torch.full_like(modes, p33_u32),
+    )
+    if not bool(torch.all(pair_offsets_u32 >= 0)):
+        raise ValueError("pair_offsets_u32 must be non-negative")
+    order = torch.argsort(pair_offsets_u32)
+    sorted_offsets = pair_offsets_u32.index_select(0, order)
+    sorted_lengths = lengths_u32.index_select(0, order)
+    expected_offsets = torch.empty_like(sorted_lengths)
+    expected_offsets[0] = 0
+    if num_experts > 1:
+        expected_offsets[1:] = torch.cumsum(sorted_lengths[:-1], dim=0)
+    if not bool(torch.equal(sorted_offsets, expected_offsets)):
+        raise ValueError(
+            "pair_offsets_u32 must describe a gap-free, non-overlapping compact "
+            "packing of the exact P33/P43 payload lengths"
+        )
+    total_u32 = int((sorted_offsets[-1] + sorted_lengths[-1]).item())
+    if w13_payload.numel() != 4 * total_u32:
+        raise ValueError(
+            "projection-major w13_payload must contain two compact planes of "
+            f"{total_u32} uint32 values"
+        )
+    if w2_payload.numel() != 2 * total_u32:
+        raise ValueError(
+            f"w2_payload must contain {total_u32} compact uint32 values"
+        )
+    descriptors = ((pair_offsets_u32 << 1) | modes).contiguous()
+
+    for name, scale, shapes in (
+        ("gate_suh", gate_suh, ((1, hidden_size), (num_experts, hidden_size))),
+        ("up_suh", up_suh, ((1, hidden_size), (num_experts, hidden_size))),
+        (
+            "intermediate_rotations",
+            intermediate_rotations,
+            ((num_experts, 3 * intermediate_size),),
+        ),
+        ("down_svh", down_svh, ((1, hidden_size), (num_experts, hidden_size))),
+    ):
+        if (
+            scale.device != device
+            or scale.dtype != torch.float16
+            or tuple(scale.shape) not in shapes
+            or not scale.is_contiguous()
+        ):
+            raise ValueError(
+                f"{name} must be contiguous fp16 {shapes} on {device}; got "
+                f"{tuple(scale.shape)}/{scale.dtype}/{scale.device}"
+            )
+        if not bool(torch.all(torch.isfinite(scale))):
+            raise ValueError(f"{name} contains non-finite values")
+    if (gate_suh.shape[0] == 1) != (up_suh.shape[0] == 1):
+        raise ValueError("gate_suh and up_suh must both be broadcast or per-expert")
+
+    tile_config = tuple(int(value) for value in tile_config)
+    if len(tile_config) != 4:
+        raise ValueError("tile_config must contain fc1_k, fc1_n, fc2_k, fc2_n")
+    fc1_tile_k, fc1_tile_n, fc2_tile_k, fc2_tile_n = tile_config
+    if fc1_tile_n != 256:
+        raise ValueError("QSRT P33/P43 preparation requires fc1_tile_n=256")
+    if fc1_tile_k <= 0 or hidden_size % fc1_tile_k:
+        raise ValueError("fc1_tile_k must divide hidden_size")
+    if fc2_tile_k <= 0 or fc2_tile_k > 128 or 128 % fc2_tile_k:
+        raise ValueError("fc2_tile_k must be a positive divisor of 128")
+    if fc2_tile_n <= 0 or hidden_size % fc2_tile_n:
+        raise ValueError("fc2_tile_n must divide hidden_size")
+    if (fc1_tile_k * fc1_tile_n) // 64 != (fc2_tile_k * fc2_tile_n) // 64:
+        raise ValueError("FC1 and FC2 pair tiles must use the same CTA thread count")
+
+    if dummy_scale is None:
+        dummy_scale = torch.zeros(4, dtype=torch.uint8, device=device)
+    elif (
+        dummy_scale.device != device
+        or dummy_scale.dtype != torch.uint8
+        or tuple(dummy_scale.shape) != (4,)
+        or not dummy_scale.is_contiguous()
+        or int(dummy_scale.data_ptr()) % 16
+    ):
+        raise ValueError(
+            "dummy_scale must be contiguous aligned uint8[4] on the weight device"
+        )
+    if workspace is None:
+        workspace = _make_workspace(device, max_blocks_per_sm=4)
+    elif (
+        workspace.device != device
+        or workspace.dtype != torch.int32
+        or not workspace.is_contiguous()
+    ):
+        raise ValueError("workspace must be contiguous int32 on the weight device")
+
+    global_scale = torch.ones((num_experts,), dtype=torch.float32, device=device)
+    return PreparedW4A16MoeWeights(
+        w13=w13_payload.view(torch.int32),
+        w13_scale=dummy_scale,
+        w13_global_scale=global_scale,
+        w2=w2_payload.view(torch.int32),
+        w2_scale=dummy_scale,
+        w2_global_scale=global_scale,
+        workspace=workspace,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        num_experts=num_experts,
+        is_gated=True,
+        params_dtype=params_dtype,
+        fc1_tile_n=fc1_tile_n,
+        fc2_tile_n=fc2_tile_n,
+        source_format="qsrt_sqg_e4m3",
+        w13_layout="trellis3_t256_proj",
+        weight_layout="trellis3_t256",
+        scale_format="e4m3_k32",
+        trellis_codebook="sqg_xor_cheb_t12",
+        trellis_bits=3,
+        fc1_trellis_pair_kind="P33_P43",
+        fc2_trellis_pair_kind="P33_P43",
+        fc1_trellis_pair_modes=descriptors,
+        fc2_trellis_pair_modes=descriptors,
+        gate_suh=gate_suh,
+        up_suh=up_suh,
+        intermediate_rotations=intermediate_rotations,
+        down_svh=down_svh,
+        tile_config=tile_config,
+    )
+
+
+def _qsrt_coupled_rotation_signs(
+    length: int,
+    *,
+    draw: int,
+    axis: int,
+) -> torch.Tensor:
+    """Reproduce kquant's frozen CPU Rademacher draw exactly."""
+
+    if length <= 0 or not 0 <= draw < 8:
+        raise ValueError("QSRT coupled rotation draw is outside its contract")
+    if draw == 0:
+        return torch.ones(length, dtype=torch.float32)
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(
+        (
+            0x6A09E667F3BCC909 * int(draw)
+            + 0xBB67AE8584CAA73B * int(axis)
+        )
+        & ((1 << 63) - 1)
+    )
+    return (
+        torch.randint(0, 2, (length,), generator=generator)
+        .mul_(2)
+        .sub_(1)
+        .float()
+    )
+
+
+def _prepare_qsrt_p22_atom_v2_moe_weights(
+    atom_payload: torch.Tensor,
+    *,
+    first_atom_slot: int,
+    rotation_draws: torch.Tensor,
+    hidden_size: int,
+    intermediate_size: int,
+    num_experts: int,
+    activation: str,
+    gate_suh: torch.Tensor,
+    up_suh: torch.Tensor,
+    down_svh: torch.Tensor,
+    params_dtype: torch.dtype,
+    codebook: str,
+    tile_config: tuple[int, int, int, int],
+    dummy_scale: torch.Tensor | None,
+    workspace: torch.Tensor | None,
+) -> PreparedW4A16MoeWeights:
+    """Restore one balanced pure-K2 coupled-Hadamard atom extent."""
+
+    atom_count = int(atom_payload.shape[0])
+    if atom_count <= 0 or first_atom_slot < 0 or first_atom_slot + atom_count > 96:
+        raise ValueError("pure-K2 atom extent lies outside the 96-slot axis")
+    if first_atom_slot % 4 or atom_count % 4:
+        raise ValueError(
+            "pure-K2 atom extents must close 128-channel postactivation blocks"
+        )
+    pre_half_atoms = 48
+    if first_atom_slot < pre_half_atoms < first_atom_slot + atom_count:
+        raise ValueError(
+            "pure-K2 atom extents must not cross the two transformed "
+            "preactivation halves"
+        )
+    source_intermediate_size = atom_count * 32
+    if (
+        intermediate_size < source_intermediate_size
+        or intermediate_size % 128
+    ):
+        raise ValueError(
+            "pure-K2 runtime intermediate size must contain its atom extent "
+            "and close 128-channel postactivation blocks"
+        )
+    if atom_payload.shape[1] < num_experts * _QSRT_V2_P22_ATOM_BUNDLE_BYTES:
+        raise ValueError("pure-K2 atom row is shorter than its expert bundles")
+    payload_bytes = num_experts * _QSRT_V2_P22_ATOM_BUNDLE_BYTES
+    if bool(torch.any(atom_payload[:, payload_bytes:] != 0)):
+        raise ValueError("pure-K2 atom-row padding must be zero")
+    if (
+        rotation_draws.dtype != torch.uint8
+        or tuple(rotation_draws.shape) != (num_experts,)
+        or not rotation_draws.is_contiguous()
+        or rotation_draws.device.type != "cpu"
+        or bool(torch.any(rotation_draws > 7))
+    ):
+        raise ValueError(
+            "pure-K2 rotation_draws must be contiguous CPU uint8[num_experts]"
+        )
+
+    device = gate_suh.device
+    source = atom_payload[:, :payload_bytes].reshape(
+        atom_count, num_experts, _QSRT_V2_P22_ATOM_BUNDLE_BYTES
+    )
+    hidden_tiles = hidden_size // 16
+    source_local_tiles = source_intermediate_size // 16
+    local_tiles = intermediate_size // 16
+    w13 = torch.zeros(
+        (2, num_experts, hidden_tiles, local_tiles, 32),
+        dtype=torch.int16,
+        device=device,
+    )
+    w2 = torch.zeros(
+        (num_experts, local_tiles, hidden_tiles, 32),
+        dtype=torch.int16,
+        device=device,
+    )
+    intermediate_rotations = torch.zeros(
+        (num_experts, 3 * intermediate_size),
+        dtype=torch.float16,
+        device=device,
+    )
+    scale_base = 3 * _QSRT_V2_P22_MATRIX_TRELLIS_BYTES
+
+    for first_expert in range(0, num_experts, 64):
+        count = min(64, num_experts - first_expert)
+        for matrix_index in range(3):
+            begin = matrix_index * _QSRT_V2_P22_MATRIX_TRELLIS_BYTES
+            raw = source[
+                :,
+                first_expert : first_expert + count,
+                begin : begin + _QSRT_V2_P22_MATRIX_TRELLIS_BYTES,
+            ]
+            values = (
+                raw.contiguous()
+                .to(device=device)
+                .view(torch.int16)
+                .reshape(atom_count, count, 2, hidden_tiles, 32)
+            )
+            if matrix_index < 2:
+                restored = (
+                    values.permute(1, 3, 0, 2, 4)
+                    .reshape(count, hidden_tiles, source_local_tiles, 32)
+                )
+                w13[
+                    matrix_index,
+                    first_expert : first_expert + count,
+                    :,
+                    :source_local_tiles,
+                ].copy_(restored)
+            else:
+                restored = (
+                    values.permute(1, 0, 2, 3, 4)
+                    .reshape(count, source_local_tiles, hidden_tiles, 32)
+                )
+                w2[
+                    first_expert : first_expert + count,
+                    :source_local_tiles,
+                ].copy_(restored)
+
+            scale_begin = scale_base + matrix_index * 64
+            scales = (
+                source[
+                    :,
+                    first_expert : first_expert + count,
+                    scale_begin : scale_begin + 64,
+                ]
+                .contiguous()
+                .to(device=device)
+                .view(torch.float16)
+                .permute(1, 0, 2)
+                .reshape(count, source_intermediate_size)
+            )
+            intermediate_rotations[
+                first_expert : first_expert + count,
+                matrix_index * intermediate_size : matrix_index
+                * intermediate_size
+                + source_intermediate_size,
+            ].copy_(scales)
+
+    # The preactivation signs index the interleaved length-2I coordinate and
+    # the postactivation signs index the ordinary I coordinate.  Atom-v2's
+    # coupled placement makes both slices contiguous for every balanced rank.
+    pre_begin = 2 * first_atom_slot * 32
+    pre_count = 2 * source_intermediate_size
+    post_begin = first_atom_slot * 32
+    signs = torch.ones(
+        (num_experts, 3 * intermediate_size), dtype=torch.float16
+    )
+    for draw in sorted(set(int(value) for value in rotation_draws.tolist())):
+        rows = torch.nonzero(rotation_draws == draw, as_tuple=False).flatten()
+        pre = _qsrt_coupled_rotation_signs(2 * 3072, draw=draw, axis=1)[
+            pre_begin : pre_begin + pre_count
+        ]
+        post = _qsrt_coupled_rotation_signs(3072, draw=draw, axis=2)[
+            post_begin : post_begin + source_intermediate_size
+        ]
+        draw_signs = torch.ones(
+            (rows.numel(), 3 * intermediate_size), dtype=torch.float16
+        )
+        draw_signs[:, :pre_count].copy_(
+            pre.to(torch.float16).expand(rows.numel(), -1)
+        )
+        draw_signs[
+            :,
+            2 * intermediate_size : 2 * intermediate_size
+            + source_intermediate_size,
+        ].copy_(post.to(torch.float16).expand(rows.numel(), -1))
+        signs.index_copy_(0, rows, draw_signs)
+    coupled_signs = signs.to(device=device, non_blocking=True).contiguous()
+
+    # Each balanced rank owns a contiguous slice of the transformed length-2I
+    # preactivation axis.  Both physical FC1 slots in that slice therefore use
+    # the same ordinary input-side scale table: the first 48 atoms derive from
+    # the first stored half, and the final 48 from the second.
+    source_suh = gate_suh if first_atom_slot < pre_half_atoms else up_suh
+
+    prepared = prepare_trellis256_moe_weights(
+        w13,
+        w2,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        num_experts=num_experts,
+        activation=activation,
+        params_dtype=params_dtype,
+        fc1_tile_n=tile_config[1],
+        fc2_tile_n=tile_config[3],
+        w13_layout="trellis3_t256_proj",
+        trellis_bits=2,
+        dummy_scale=dummy_scale,
+        codebook=codebook,
+        gate_suh=source_suh,
+        up_suh=source_suh,
+        intermediate_rotations=intermediate_rotations,
+        down_svh=down_svh,
+        tile_config=tile_config,
+        workspace=workspace,
+    )
+    return replace(
+        prepared,
+        coupled_hadamard=True,
+        intermediate_rotations=torch.cat(
+            (intermediate_rotations, coupled_signs), dim=1
+        ).contiguous(),
+    )
+
+
+def _prepare_qsrt_coupled_h308_atom_v2_moe_weights(
+    atom_payload: torch.Tensor,
+    *,
+    first_atom_slot: int,
+    rotation_draws: torch.Tensor,
+    hidden_size: int,
+    intermediate_size: int,
+    num_experts: int,
+    activation: str,
+    gate_suh: torch.Tensor,
+    up_suh: torch.Tensor,
+    down_svh: torch.Tensor,
+    params_dtype: torch.dtype,
+    codebook: str,
+    tile_config: tuple[int, int, int, int],
+    dummy_scale: torch.Tensor | None,
+    workspace: torch.Tensor | None,
+) -> PreparedW4A16MoeWeights:
+    """Restore one balanced coupled-Hadamard H308 atom extent."""
+
+    atom_count = int(atom_payload.shape[0])
+    if atom_count != 8 or first_atom_slot % 8 or not 0 <= first_atom_slot <= 88:
+        raise ValueError(
+            "coupled H308 extents must contain one aligned eight-atom pair"
+        )
+    if intermediate_size != 256:
+        raise ValueError("coupled H308 requires local intermediate_size=256")
+    physical_pair = first_atom_slot // 8
+    if physical_pair == 5:
+        fc1_kind, fc2_kind = "P43", "P33"
+        fc1_matrix_bytes = _QSRT_V2_P43_MATRIX_TRELLIS_BYTES
+        fc2_matrix_bytes = _QSRT_V2_P33_MATRIX_TRELLIS_BYTES
+        bundle_bytes = _QSRT_V2_COUPLED_H308_P43_P33_ATOM_BUNDLE_BYTES
+    elif physical_pair == 11:
+        fc1_kind, fc2_kind = "P43", "P44"
+        fc1_matrix_bytes = _QSRT_V2_P43_MATRIX_TRELLIS_BYTES
+        fc2_matrix_bytes = _QSRT_V2_P44_MATRIX_TRELLIS_BYTES
+        bundle_bytes = _QSRT_V2_COUPLED_H308_P43_P44_ATOM_BUNDLE_BYTES
+    else:
+        fc1_kind = fc2_kind = "P33"
+        fc1_matrix_bytes = fc2_matrix_bytes = _QSRT_V2_P33_MATRIX_TRELLIS_BYTES
+        bundle_bytes = _QSRT_V2_P33_ATOM_BUNDLE_BYTES
+    if atom_payload.shape[1] < num_experts * bundle_bytes:
+        raise ValueError("coupled H308 atom row is shorter than its expert bundles")
+    payload_bytes = num_experts * bundle_bytes
+    if bool(torch.any(atom_payload[:, payload_bytes:] != 0)):
+        raise ValueError("coupled H308 atom-row padding must be zero")
+    if (
+        rotation_draws.dtype != torch.uint8
+        or tuple(rotation_draws.shape) != (num_experts,)
+        or not rotation_draws.is_contiguous()
+        or rotation_draws.device.type != "cpu"
+        or bool(torch.any(rotation_draws > 7))
+    ):
+        raise ValueError(
+            "coupled H308 rotation_draws must be contiguous CPU uint8[num_experts]"
+        )
+    if tuple(int(value) for value in tile_config) != (64, 256, 64, 256):
+        raise ValueError(
+            "coupled H308 currently requires tile_config=(64, 256, 64, 256)"
+        )
+
+    device = gate_suh.device
+    if device.type != "cuda":
+        raise ValueError("coupled H308 preparation requires CUDA output tensors")
+    for name, value, shapes in (
+        ("gate_suh", gate_suh, ((1, hidden_size), (num_experts, hidden_size))),
+        ("up_suh", up_suh, ((1, hidden_size), (num_experts, hidden_size))),
+        ("down_svh", down_svh, ((1, hidden_size), (num_experts, hidden_size))),
+    ):
+        if (
+            value.device != device
+            or value.dtype != torch.float16
+            or tuple(value.shape) not in shapes
+            or not value.is_contiguous()
+            or not bool(torch.all(torch.isfinite(value)))
+        ):
+            raise ValueError(
+                f"{name} must be finite contiguous fp16 {shapes} on {device}"
+            )
+    if (gate_suh.shape[0] == 1) != (up_suh.shape[0] == 1):
+        raise ValueError("gate_suh and up_suh must both be broadcast or per-expert")
+
+    source = atom_payload[:, :payload_bytes].reshape(
+        atom_count, num_experts, bundle_bytes
+    )
+    hidden_tiles = hidden_size // 16
+    pair_bits = {"P33": (3, 3), "P43": (4, 3), "P44": (4, 4)}
+
+    def restore_matrix(
+        begin: int,
+        matrix_bytes: int,
+        kind: str,
+        *,
+        fc1: bool,
+        out: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        low_bits, high_bits = pair_bits[kind]
+        low_bytes = hidden_tiles * 32 * low_bits
+        if low_bytes + hidden_tiles * 32 * high_bits != matrix_bytes:
+            raise AssertionError("coupled H308 matrix geometry drifted")
+        elements_per_expert = atom_count * matrix_bytes // 2
+        if out is None:
+            out = torch.empty(
+                (num_experts, elements_per_expert),
+                dtype=torch.int16,
+                device=device,
+            )
+        elif (
+            out.dtype != torch.int16
+            or out.device != device
+            or tuple(out.shape) != (num_experts, elements_per_expert)
+            or not out.is_contiguous()
+        ):
+            raise ValueError("coupled H308 restore destination has invalid geometry")
+        for first_expert in range(0, num_experts, 64):
+            count = min(64, num_experts - first_expert)
+            raw = source[
+                :,
+                first_expert : first_expert + count,
+                begin : begin + matrix_bytes,
+            ]
+            low = (
+                raw[..., :low_bytes]
+                .contiguous()
+                .to(device=device)
+                .view(torch.int16)
+                .reshape(atom_count, count, hidden_tiles, 16 * low_bits)
+            )
+            high = (
+                raw[..., low_bytes:]
+                .contiguous()
+                .to(device=device)
+                .view(torch.int16)
+                .reshape(atom_count, count, hidden_tiles, 16 * high_bits)
+            )
+            if fc1:
+                low = low.permute(1, 2, 0, 3).reshape(count, hidden_tiles, -1)
+                high = high.permute(1, 2, 0, 3).reshape(count, hidden_tiles, -1)
+                restored = torch.cat((low, high), dim=2).reshape(count, -1)
+            else:
+                low = low.permute(1, 0, 2, 3).reshape(count, -1)
+                high = high.permute(1, 0, 2, 3).reshape(count, -1)
+                restored = torch.cat((low, high), dim=1)
+            out[first_expert : first_expert + count].copy_(restored)
+        return out
+
+    matrix_offsets = (0, fc1_matrix_bytes, 2 * fc1_matrix_bytes)
+    fc1_elements_per_expert = atom_count * fc1_matrix_bytes // 2
+    w13_storage = torch.empty(
+        (2, num_experts, fc1_elements_per_expert),
+        dtype=torch.int16,
+        device=device,
+    )
+    restore_matrix(
+        matrix_offsets[0],
+        fc1_matrix_bytes,
+        fc1_kind,
+        fc1=True,
+        out=w13_storage[0],
+    )
+    restore_matrix(
+        matrix_offsets[1],
+        fc1_matrix_bytes,
+        fc1_kind,
+        fc1=True,
+        out=w13_storage[1],
+    )
+    w13 = w13_storage.reshape(-1)
+    w2 = restore_matrix(
+        matrix_offsets[2], fc2_matrix_bytes, fc2_kind, fc1=False
+    ).reshape(-1)
+
+    scale_base = 2 * fc1_matrix_bytes + fc2_matrix_bytes
+    intermediate_scales = torch.empty(
+        (num_experts, 3 * intermediate_size),
+        dtype=torch.float16,
+        device=device,
+    )
+    for matrix_index in range(3):
+        begin = scale_base + matrix_index * 64
+        for first_expert in range(0, num_experts, 64):
+            count = min(64, num_experts - first_expert)
+            values = (
+                source[
+                    :,
+                    first_expert : first_expert + count,
+                    begin : begin + 64,
+                ]
+                .contiguous()
+                .to(device=device)
+                .view(torch.float16)
+                .reshape(atom_count, count, 32)
+            )
+            restored = torch.cat(
+                (
+                    values[:, :, :16].permute(1, 0, 2).reshape(count, 128),
+                    values[:, :, 16:].permute(1, 0, 2).reshape(count, 128),
+                ),
+                dim=1,
+            )
+            intermediate_scales[
+                first_expert : first_expert + count,
+                matrix_index
+                * intermediate_size : (matrix_index + 1)
+                * intermediate_size,
+            ].copy_(restored)
+
+    pre_begin = 2 * first_atom_slot * 32
+    post_begin = first_atom_slot * 32
+    signs = torch.empty((num_experts, 3 * intermediate_size), dtype=torch.float16)
+    for draw in sorted(set(int(value) for value in rotation_draws.tolist())):
+        rows = torch.nonzero(rotation_draws == draw, as_tuple=False).flatten()
+        pre = _qsrt_coupled_rotation_signs(6144, draw=draw, axis=1)[
+            pre_begin : pre_begin + 2 * intermediate_size
+        ]
+        post = _qsrt_coupled_rotation_signs(3072, draw=draw, axis=2)[
+            post_begin : post_begin + intermediate_size
+        ]
+        signs.index_copy_(
+            0,
+            rows,
+            torch.cat((pre, post)).to(torch.float16).expand(rows.numel(), -1),
+        )
+    rotations = torch.cat(
+        (intermediate_scales, signs.to(device=device, non_blocking=True)), dim=1
+    ).contiguous()
+
+    if dummy_scale is None:
+        dummy_scale = torch.zeros(4, dtype=torch.uint8, device=device)
+    if (
+        dummy_scale.device != device
+        or dummy_scale.dtype != torch.uint8
+        or tuple(dummy_scale.shape) != (4,)
+        or not dummy_scale.is_contiguous()
+        or dummy_scale.data_ptr() % 16
+    ):
+        raise ValueError(
+            "dummy_scale must be contiguous aligned uint8[4] on the weight device"
+        )
+    if workspace is None:
+        workspace = _make_workspace(device, max_blocks_per_sm=4)
+    if (
+        workspace.device != device
+        or workspace.dtype != torch.int32
+        or not workspace.is_contiguous()
+    ):
+        raise ValueError("workspace must be contiguous int32 on the weight device")
+    normalized_codebook = _trellis256_marker_codebook(
+        mcg=None, mul1_e4m3=None, codebook=codebook
+    )
+    global_scale = torch.ones((num_experts,), dtype=torch.float32, device=device)
+    source_suh = gate_suh if physical_pair < 6 else up_suh
+    return PreparedW4A16MoeWeights(
+        w13=w13.view(torch.int32),
+        w13_scale=dummy_scale,
+        w13_global_scale=global_scale,
+        w2=w2.view(torch.int32),
+        w2_scale=dummy_scale,
+        w2_global_scale=global_scale,
+        workspace=workspace,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        num_experts=num_experts,
+        is_gated=True,
+        params_dtype=params_dtype,
+        fc1_tile_n=256,
+        fc2_tile_n=256,
+        source_format="qsrt_sqg_e4m3",
+        w13_layout="trellis3_t256_proj",
+        weight_layout="trellis3_t256",
+        scale_format="e4m3_k32",
+        trellis_codebook=normalized_codebook,
+        trellis_bits=3,
+        fc1_trellis_pair_kind=fc1_kind,
+        fc2_trellis_pair_kind=fc2_kind,
+        gate_suh=source_suh,
+        up_suh=source_suh,
+        intermediate_rotations=rotations,
+        down_svh=down_svh,
+        coupled_hadamard=True,
+        tile_config=(64, 256, 64, 256),
+    )
+
+
+def prepare_qsrt_atom_v2_moe_weights(
+    atom_payload: torch.Tensor,
+    *,
+    first_atom_slot: int,
+    layer_index: int,
+    profile: str = _QSRT_V2_PROFILE_H308,
+    rotation_draws: torch.Tensor | None = None,
+    hidden_size: int,
+    intermediate_size: int,
+    num_experts: int,
+    activation: str,
+    gate_suh: torch.Tensor,
+    up_suh: torch.Tensor,
+    down_svh: torch.Tensor,
+    params_dtype: torch.dtype = torch.float16,
+    codebook: str = "sqg_xor_cheb_t12",
+    tile_config: tuple[int, int, int, int] = (64, 256, 64, 256),
+    dummy_scale: torch.Tensor | None = None,
+    workspace: torch.Tensor | None = None,
+) -> PreparedW4A16MoeWeights:
+    """Prepare one balanced rank extent from a QSRT atoms-v2 profile."""
+
+    hidden_size = int(hidden_size)
+    intermediate_size = int(intermediate_size)
+    num_experts = int(num_experts)
+    first_atom_slot = int(first_atom_slot)
+    layer_index = int(layer_index)
+    if num_experts != 896:
+        raise ValueError("QSRT atoms-v2 currently requires all 896 experts")
+    if hidden_size != 3584:
+        raise ValueError("QSRT atoms-v2 currently requires hidden_size=3584")
+    if profile not in {
+        _QSRT_V2_PROFILE_H308,
+        _QSRT_V2_PROFILE_COUPLED_K2,
+        _QSRT_V2_PROFILE_COUPLED_H308,
+    }:
+        raise ValueError(f"unsupported QSRT atoms-v2 profile {profile!r}")
+    if not validate_activation(activation) or params_dtype != torch.float16:
+        raise ValueError("QSRT atoms-v2 requires gated fp16 preparation")
+    if _normalize_trellis256_codebook(codebook) != "sqg_xor_cheb_t12":
+        raise ValueError("QSRT atoms-v2 supports only sqg_xor_cheb_t12")
+    if (
+        atom_payload.dtype != torch.uint8
+        or atom_payload.ndim != 2
+        or atom_payload.shape[0] <= 0
+        or not atom_payload.is_contiguous()
+        or atom_payload.device.type not in {"cpu", "cuda"}
+    ):
+        raise ValueError(
+            "atom_payload must be contiguous CPU/CUDA uint8 [atoms, row_stride]"
+        )
+    if not 1 <= layer_index <= 92:
+        raise ValueError("layer_index must identify a Kimi-K3 MoE layer")
+
+    if profile == _QSRT_V2_PROFILE_COUPLED_K2:
+        if rotation_draws is None:
+            raise ValueError("pure-K2 atoms-v2 requires coupled rotation draws")
+        return _prepare_qsrt_p22_atom_v2_moe_weights(
+            atom_payload,
+            first_atom_slot=first_atom_slot,
+            rotation_draws=rotation_draws,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_experts=num_experts,
+            activation=activation,
+            gate_suh=gate_suh,
+            up_suh=up_suh,
+            down_svh=down_svh,
+            params_dtype=params_dtype,
+            codebook=codebook,
+            tile_config=tile_config,
+            dummy_scale=dummy_scale,
+            workspace=workspace,
+        )
+    if profile == _QSRT_V2_PROFILE_COUPLED_H308:
+        if rotation_draws is None:
+            raise ValueError("coupled H308 atoms-v2 requires rotation draws")
+        return _prepare_qsrt_coupled_h308_atom_v2_moe_weights(
+            atom_payload,
+            first_atom_slot=first_atom_slot,
+            rotation_draws=rotation_draws,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_experts=num_experts,
+            activation=activation,
+            gate_suh=gate_suh,
+            up_suh=up_suh,
+            down_svh=down_svh,
+            params_dtype=params_dtype,
+            codebook=codebook,
+            tile_config=tile_config,
+            dummy_scale=dummy_scale,
+            workspace=workspace,
+        )
+
+    if intermediate_size != 256:
+        raise ValueError("H308 atoms-v2 preparation requires 256 local channels")
+    if atom_payload.shape[0] != _QSRT_ATOMS_PER_PAIR:
+        raise ValueError("H308 atoms-v2 requires exactly eight atom rows")
+    if first_atom_slot % _QSRT_ATOMS_PER_PAIR or not 0 <= first_atom_slot < 96:
+        raise ValueError("H308 atoms-v2 requires a pair-aligned atom extent")
+    if rotation_draws is not None:
+        raise ValueError("H308 atoms-v2 must not carry coupled rotation draws")
+
+    device = gate_suh.device
+    if device.type != "cuda":
+        raise ValueError("QSRT atoms-v2 preparation requires CUDA output tensors")
+    physical_pair = first_atom_slot // _QSRT_ATOMS_PER_PAIR
+    expert_ids = torch.arange(num_experts, dtype=torch.int64, device=device)
+    rotation = (_QSRT_EXPERT_ROTATION_MULTIPLIER * expert_ids + layer_index) % 12
+    base_pair = (physical_pair - rotation) % 12
+    modes = ((base_pair == 0) | (base_pair == 6)).to(torch.int64)
+    p33_ids = torch.nonzero(modes == 0, as_tuple=False).flatten()
+    p43_ids = torch.nonzero(modes == 1, as_tuple=False).flatten()
+    count33 = int(p33_ids.numel())
+    count43 = int(p43_ids.numel())
+    p33_bytes = count33 * _QSRT_V2_P33_ATOM_BUNDLE_BYTES
+    p43_bytes = count43 * _QSRT_V2_P43_ATOM_BUNDLE_BYTES
+    if atom_payload.shape[1] < p33_bytes + p43_bytes:
+        raise ValueError("QSRT atoms-v2 row is shorter than its compact groups")
+    if bool(torch.any(atom_payload[:, p33_bytes + p43_bytes :] != 0)):
+        raise ValueError("QSRT atoms-v2 row padding must be zero")
+
+    groups: list[tuple[torch.Tensor, torch.Tensor, bool, int]] = []
+    for ids, p43, begin, bundle in (
+        (p33_ids, False, 0, _QSRT_V2_P33_ATOM_BUNDLE_BYTES),
+        (p43_ids, True, p33_bytes, _QSRT_V2_P43_ATOM_BUNDLE_BYTES),
+    ):
+        count = int(ids.numel())
+        view = atom_payload[:, begin : begin + count * bundle].reshape(
+            _QSRT_ATOMS_PER_PAIR, count, bundle
+        )
+        groups.append((ids, view, p43, bundle))
+
+    hidden_tiles = hidden_size // 16
+
+    def _restore_group_matrix_into(
+        source: torch.Tensor,
+        matrix_index: int,
+        destination: torch.Tensor,
+        *,
+        p43: bool,
+        fc1: bool,
+    ) -> None:
+        low_bits, high_bits = ((4, 3) if p43 else (3, 3))
+        matrix_bytes = (
+            _QSRT_V2_P43_MATRIX_TRELLIS_BYTES
+            if p43
+            else _QSRT_V2_P33_MATRIX_TRELLIS_BYTES
+        )
+        count = source.shape[1]
+        words_per_expert = destination.numel() // count
+        destination = destination.reshape(count, words_per_expert)
+        # The canonical slab is close to 1 GiB per rank.  Stream bounded
+        # expert groups through the GPU so loading never needs the canonical
+        # slab and its equally-sized prepared view resident at once.
+        for first_expert in range(0, count, 64):
+            chunk_count = min(64, count - first_expert)
+            raw = source[
+                :,
+                first_expert : first_expert + chunk_count,
+                matrix_index * matrix_bytes : (matrix_index + 1) * matrix_bytes,
+            ]
+            selected = (
+                raw.contiguous()
+                .to(device=device)
+                .view(torch.int16)
+                .reshape(_QSRT_ATOMS_PER_PAIR, chunk_count, -1)
+                .permute(1, 0, 2)
+            )
+            low_words = hidden_tiles * 16 * low_bits
+            low = selected[..., :low_words].reshape(
+                chunk_count,
+                _QSRT_ATOMS_PER_PAIR,
+                hidden_tiles,
+                16 * low_bits,
+            )
+            high = selected[..., low_words:].reshape(
+                chunk_count,
+                _QSRT_ATOMS_PER_PAIR,
+                hidden_tiles,
+                16 * high_bits,
+            )
+            target = destination[first_expert : first_expert + chunk_count]
+            if fc1:
+                target = target.reshape(chunk_count, hidden_tiles, -1)
+                target[..., : _QSRT_ATOMS_PER_PAIR * 16 * low_bits].reshape(
+                    chunk_count,
+                    hidden_tiles,
+                    _QSRT_ATOMS_PER_PAIR,
+                    16 * low_bits,
+                ).copy_(low.permute(0, 2, 1, 3))
+                target[..., _QSRT_ATOMS_PER_PAIR * 16 * low_bits :].reshape(
+                    chunk_count,
+                    hidden_tiles,
+                    _QSRT_ATOMS_PER_PAIR,
+                    16 * high_bits,
+                ).copy_(high.permute(0, 2, 1, 3))
+            else:
+                low_words_per_expert = low.numel() // chunk_count
+                target[:, :low_words_per_expert].copy_(
+                    low.reshape(chunk_count, -1)
+                )
+                target[:, low_words_per_expert:].copy_(
+                    high.reshape(chunk_count, -1)
+                )
+
+    group_matrix_words = []
+    for ids, _source, p43, _bundle in groups:
+        matrix_bytes = (
+            _QSRT_V2_P43_MATRIX_TRELLIS_BYTES
+            if p43
+            else _QSRT_V2_P33_MATRIX_TRELLIS_BYTES
+        )
+        group_matrix_words.append(
+            int(ids.numel()) * _QSRT_ATOMS_PER_PAIR * matrix_bytes // 2
+        )
+    matrix_words = sum(group_matrix_words)
+    w13_payload = torch.empty(2 * matrix_words, dtype=torch.int16, device=device)
+    w2_payload = torch.empty(matrix_words, dtype=torch.int16, device=device)
+
+    for matrix_index in range(2):
+        group_offset = matrix_index * matrix_words
+        for group_words, (_ids, source, p43, _bundle) in zip(
+            group_matrix_words, groups
+        ):
+            _restore_group_matrix_into(
+                source,
+                matrix_index,
+                w13_payload.narrow(0, group_offset, group_words),
+                p43=p43,
+                fc1=True,
+            )
+            group_offset += group_words
+    group_offset = 0
+    for group_words, (_ids, source, p43, _bundle) in zip(
+        group_matrix_words, groups
+    ):
+        _restore_group_matrix_into(
+            source,
+            2,
+            w2_payload.narrow(0, group_offset, group_words),
+            p43=p43,
+            fc1=False,
+        )
+        group_offset += group_words
+
+    p33_u32 = hidden_tiles * 8 * 8 * 6
+    p43_u32 = hidden_tiles * 8 * 8 * 7
+    offsets = torch.empty(num_experts, dtype=torch.int64, device=device)
+    offsets.index_copy_(0, p33_ids, torch.arange(count33, device=device) * p33_u32)
+    offsets.index_copy_(
+        0,
+        p43_ids,
+        count33 * p33_u32 + torch.arange(count43, device=device) * p43_u32,
+    )
+
+    intermediate_rotations = torch.empty(
+        (num_experts, 3 * intermediate_size), dtype=torch.float16, device=device
+    )
+    for ids, source, p43, _bundle in groups:
+        matrix_bytes = (
+            _QSRT_V2_P43_MATRIX_TRELLIS_BYTES
+            if p43
+            else _QSRT_V2_P33_MATRIX_TRELLIS_BYTES
+        )
+        count = int(ids.numel())
+        matrices = []
+        for matrix_index in range(3):
+            begin = 3 * matrix_bytes + matrix_index * _QSRT_MATRIX_ATOM_SCALE_BYTES
+            raw = source.narrow(2, begin, _QSRT_MATRIX_ATOM_SCALE_BYTES)
+            values = (
+                raw.contiguous()
+                .to(device=device)
+                .view(torch.float16)
+                .reshape(_QSRT_ATOMS_PER_PAIR, count, _QSRT_ATOM_CHANNELS)
+                .permute(1, 0, 2)
+            )
+            matrices.append(
+                torch.cat(
+                    (
+                        values[..., :16].reshape(count, -1),
+                        values[..., 16:].reshape(count, -1),
+                    ),
+                    dim=1,
+                )
+            )
+        intermediate_rotations.index_copy_(0, ids, torch.cat(tuple(matrices), dim=1))
+
+    return _prepare_qsrt_p33_p43_moe_weights(
+        w13_payload,
+        w2_payload,
+        pair_offsets_u32=offsets,
+        pair_is_p43=modes,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        num_experts=num_experts,
+        activation=activation,
+        gate_suh=gate_suh,
+        up_suh=up_suh,
+        intermediate_rotations=intermediate_rotations.contiguous(),
+        down_svh=down_svh,
+        params_dtype=params_dtype,
+        codebook=codebook,
+        tile_config=tile_config,
+        dummy_scale=dummy_scale,
+        workspace=workspace,
+    )
+
+
 def prepare_qsrt_atom_moe_weights(
     atom_payload: torch.Tensor,
     *,
@@ -2835,6 +3920,7 @@ __all__ = [
     "prepare_trellis256_dense_weight",
     "prepare_trellis256_pair_dense_weight",
     "prepare_qsrt_atom_moe_weights",
+    "prepare_qsrt_atom_v2_moe_weights",
     "prepare_w4a16_compressed_tensors_weights",
     "prepare_w4a16_e8m0_native_weights",
     "prepare_w4a16_fc2_e8m0_weights",
