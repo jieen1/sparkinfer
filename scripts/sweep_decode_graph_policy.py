@@ -29,7 +29,7 @@ import torch
 
 from b12x.attention.paged.planner import PagedPlan, create_paged_plan
 from b12x.attention.paged.tuning.registry import normalize_kv_dtype_key
-from b12x.integration.attention import PagedAttentionWorkspace
+from b12x.attention.paged.workspace import PagedAttentionWorkspace
 
 from benchmarks.benchmark_paged_attention import (
     _bench_graph,
