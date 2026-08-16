@@ -3267,21 +3267,25 @@ class PagedForwardKernel:
             traits.num_warps_kv * self.heads_per_cta
             + (1 if self.role_specialized_decode else 0)
         )
-        self.num_stages = (
-            3
-            if (
-                bf16_minimax_head128_decode
-                and q_stage_bytes + 3 * kv_stage_bytes
-                <= traits.max_smem_per_threadblock
-            )
-            else 1
-            if traits.num_warps_kv > 1 or self.kv_is_fp8
-            else (
-                2
-                if q_stage_bytes + 2 * kv_stage_bytes <= traits.max_smem_per_threadblock
+        _override_stages = os.environ.get("B12X_PAGED_NUM_STAGES")
+        if _override_stages is not None:
+            self.num_stages = int(_override_stages)
+        else:
+            self.num_stages = (
+                3
+                if (
+                    bf16_minimax_head128_decode
+                    and q_stage_bytes + 3 * kv_stage_bytes
+                    <= traits.max_smem_per_threadblock
+                )
                 else 1
+                if traits.num_warps_kv > 1 or self.kv_is_fp8
+                else (
+                    2
+                    if q_stage_bytes + 2 * kv_stage_bytes <= traits.max_smem_per_threadblock
+                    else 1
+                )
             )
-        )
         paired_q_stage_bytes = q_stage_bytes * self.heads_per_cta
         paired_kv_stage_bytes = kv_stage_bytes * self.heads_per_cta
         self.shared_storage_bytes = max(

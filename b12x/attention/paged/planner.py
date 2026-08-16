@@ -695,6 +695,9 @@ def infer_paged_mode(cu_seqlens_q: torch.Tensor) -> Literal["decode", "extend"]:
 
 def _fa2_determine_cta_tile_q(avg_packed_qo_len: int, head_dim: int) -> int:
     # Faithful to FlashInfer's FA2DetermineCtaTileQ.
+    _override = os.environ.get("B12X_PAGED_CTA_TILE_Q")
+    if _override is not None:
+        return int(_override)
     if avg_packed_qo_len > 64 and head_dim < 256:
         return 128
     if avg_packed_qo_len > 16:
@@ -762,6 +765,11 @@ def _paged_determine_cta_tile_q(
     if mode == "extend" and packed_qo_len <= 32:
         del kv_dtype, head_dim, max_effective_kv_pages
         return 16
+
+    _tile_override = os.environ.get("B12X_PAGED_CTA_TILE_Q")
+    if mode == "extend" and _tile_override is not None:
+        del kv_dtype, head_dim, max_effective_kv_pages
+        return int(_tile_override)
 
     cta_tile_q = _fa2_determine_cta_tile_q(packed_qo_len, head_dim)
     del max_effective_kv_pages
