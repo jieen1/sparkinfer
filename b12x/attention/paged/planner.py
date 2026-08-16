@@ -729,9 +729,13 @@ def _paged_determine_cta_tile_q(
         and kv_dtype == _FP8_KV_DTYPE
         and packed_qo_len <= 32
         and head_dim == 256
-        and page_size == 128
+        and page_size in (32, 128)
     ):
         # Qwen3.6's uniform q=4/GQA6 verifier has exactly 24 packed rows.
+        # page_size=32 added 2026-08-16 (Qwen3.8 production block size):
+        # the M32 raw verifier tile covers the whole request at either page
+        # size, halving the paged K/V reads of the M16 geometry.  The
+        # SPARKINFER_QWEN36_VERIFY_M16 knob below forces the old geometry.
         # One M32 raw-FP8 verifier tile covers the whole request, so every
         # paged K/V tile is read once per request instead of twice through
         # the two M16 query tiles (validated 2026-08-06 in qwen-sm120-runtime
